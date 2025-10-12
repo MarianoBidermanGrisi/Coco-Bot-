@@ -1,484 +1,414 @@
-# bot_inteligente.py
+import ccxt
 import pandas as pd
 import numpy as np
-from binance.client import Client
-from datetime import datetime, timedelta
 import time
-import schedule
+import logging
 import json
-import os
-import asyncio
+import requests
+from datetime import datetime, timedelta
 
-# ===============================
-# 🔐 Configuración Binance
-# ===============================
-BINANCE_API_KEY = "oCYyOTBPPLr2ggLx8yszPRjSWxEecNQIL7U2iFPyhDTwsXNcD3otGMo1FtOdotHA"
-BINANCE_API_SECRET = "9qtqNGYJSQqJPVQPaRLt0vYbRo4IPnSj3hby1sRUoWBbhqI4ETfRvsNPHyyZbflx"
+# Configuración logging
+logging.basicConfig(level=logging.INFO, format='> %(message)s')
 
-client = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
-
-# Símbolos y timeframes
-SYMBOLS = ["DOGEUSDT", "XRPUSDT","TRXUSDT","XLMUSDT","AVAXUSDT","ETHUSDT"]
-TIMEFRAMES = ["1m", "3m", "5m", "15m"]
-DATA_LIMIT = 1000
-MEMORIA_FILE = "memoria_senales.json"
-EVALUACION_MINUTOS = 30
-UMBRAL_CONFLUENCIA = 6.0
-
-# ===============================
-# 🛠️ Funciones técnicas
-# ===============================
-def sma(s, l): return s.rolling(l).mean()
-def ema(s, l): return s.ewm(span=l, adjust=False).mean()
-def stdev(s, l): return s.rolling(l).std()
-def change(s): return s.diff()
-def sign(s): return np.sign(s)
-def crossover(s1, s2): return (s1 > s2) & (s1.shift(1) <= s2.shift(1))
-def crossunder(s1, s2): return (s1 < s2) & (s1.shift(1) >= s2.shift(1))
-
-# ===============================
-# 📥 Descargar datos
-# ===============================
-def descargar_datos(symbol: str, interval: str, limit: int):
-    for intento in range(3):
-        try:
-            klines = client.get_klines(symbol=symbol, interval=interval, limit=limit)
-            df = pd.DataFrame(klines, columns=[
-                'timestamp', 'open', 'high', 'low', 'close', 'volume',
-                'close_time', 'quote_asset_volume', 'number_of_trades',
-                'taker_buy_base_volume', 'taker_buy_quote_volume', 'ignore'
-            ])
-            for col in ['open', 'high', 'low', 'close', 'volume']:
-                df[col] = pd.to_numeric(df[col])
-            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-            df.set_index('timestamp', inplace=True)
-            if not df.empty and len(df) >= 200:
-                return df
-        except Exception as e:
-            print(f"❌ Error descargando {symbol} ({interval}) - Intento {intento + 1}: {e}")
-            time.sleep(2)
-    print(f"⚠️ {symbol} ({interval}): No se pudieron obtener datos")
-    return None
-
-# ===============================
-# 🧠 Calcular puntaje de señal
-# ===============================
-def calcular_puntaje_senal(df: pd.DataFrame, pesos: dict) -> dict:
-    if len(df) < 200 or df['close'].isna().sum() > len(df) * 0.1:
-        return {"compra": 0, "venta": 0}
-
-    window_len = 28
-    v_len = 14
-
-    price_spread = stdev(df['high'] - df['low'], window_len)
-    signed_volume = sign(change(df['close'])) * df['volume']
-    v = signed_volume.cumsum()
-    smooth = sma(v, v_len)
-    v_spread = stdev(v - smooth, window_len)
-    shadow = ((v - smooth) / v_spread) * price_spread
-    out = np.where(shadow > 0, df['high'] + shadow, df['low'] + shadow)
-    obvema = ema(pd.Series(out), 1).ffill().bfill()
-
-    if obvema.isna().all():
-        return {"compra": 0, "venta": 0}
-
-    def dema(s, l):
-        ma1 = ema(s, l)
-        ma2 = ema(ma1, l)
-        return 2 * ma1 - ma2
-
-    ma = dema(obvema, 9)
-    slow_ma = ema(df['close'], 26)
-    macd_line = ma - slow_ma
-
-    if macd_line.isna().sum() > len(macd_line) * 0.5:
-        return {"compra": 0, "venta": 0}
-
-    def calc_slope(series, length):
-        slope_list = []
-        for i in range(len(series)):
-            if i < length:
-                slope_list.append(np.nan)
-                continue
-            y = series.iloc[i-length:i].values
-            x = np.arange(1, length+1)
-            valid_mask = ~np.isnan(y)
-            if not np.any(valid_mask):
-                slope_list.append(np.nan)
-                continue
-            y_valid = y[valid_mask]
-            x_valid = x[valid_mask]
-            if len(x_valid) < 2:
-                slope_list.append(np.nan)
-                continue
-            A = np.vstack([x_valid, np.ones(len(x_valid))]).T
-            m, _ = np.linalg.lstsq(A, y_valid, rcond=None)[0]
-            slope_list.append(m)
-        return pd.Series(slope_list, index=series.index)
-
-    tt1 = calc_slope(macd_line, 2).reindex(df.index).ffill().bfill()
-    if tt1.isna().all():
-        return {"compra": 0, "venta": 0}
-
-    diff_tt1 = (tt1 - tt1.shift(1)).abs()
-    cumSum = diff_tt1.cumsum()
-    n = np.arange(1, len(cumSum) + 1)
-    a15 = cumSum / n * 1.0
-
-    b5 = pd.Series(index=df.index, dtype=float)
-    oc = pd.Series(index=df.index, dtype=int)
-    for i in range(len(df)):
-        idx = df.index[i]
-        if i == 0:
-            b5[idx] = tt1[idx]
-            oc[idx] = 0
-        else:
-            prev_idx = df.index[i - 1]
-            prev_b5 = b5[prev_idx]
-            current_a15 = a15[idx]
-            if tt1[idx] > prev_b5 + current_a15:
-                b5[idx] = tt1[idx]
-            elif tt1[idx] < prev_b5 - current_a15:
-                b5[idx] = tt1[idx]
-            else:
-                b5[idx] = prev_b5
-            oc[idx] = 1 if b5[idx] > prev_b5 else (-1 if b5[idx] < prev_b5 else oc[prev_idx])
-
-    src4 = df['close']
-    l30 = 6
-    k30 = 1.0 / l30
-    vma_val = pd.Series(0.0, index=df.index)
-    iS = pd.Series(0.0, index=df.index)
-    for i in range(1, len(df)):
-        idx = df.index[i]
-        prev_idx = df.index[i - 1]
-        pdm = max(src4[idx] - src4[prev_idx], 0)
-        mdm = max(src4[prev_idx] - src4[idx], 0)
-        pdmS = (1-k30)*(vma_val[prev_idx] if i>1 else 0) + k30*pdm
-        mdmS = (1-k30)*0 + k30*mdm
-        s_val = pdmS + mdmS
-        pdi = pdmS/s_val if s_val else 0
-        mdi = mdmS/s_val if s_val else 0
-        pdiS = (1-k30)*0 + k30*pdi
-        mdiS = (1-k30)*0 + k30*mdi
-        d = abs(pdiS - mdiS)
-        s1 = pdiS + mdiS
-        iS_val = d/s1 if s1 else 0
-        iS[idx] = (1-k30)*iS[prev_idx] + k30*iS_val
-        start_idx = max(0, i-l30+1)
-        window = iS.iloc[start_idx:i+1]
-        hhv = window.max()
-        llv = window.min()
-        vI = (iS[idx] - llv)/(hhv - llv) if hhv != llv else 0
-        vma_val[idx] = (1-k30*vI)*vma_val[prev_idx] + k30*vI*src4[idx]
-
-    df['vma'] = vma_val
-
-    h = 8.0
-    mult = 3.0
-    coefs = np.array([np.exp(-(i**2)/(2*h*h)) for i in range(50)])
-    den = coefs.sum()
-    out30 = df['close'].rolling(50).apply(lambda x: (x * coefs[::-1]).sum() / den, raw=True)
-    mae = (df['close'] - out30).abs().rolling(50).mean() * mult
-    df['nwe_upper'] = out30 + mae
-    df['nwe_lower'] = out30 - mae
-
-    basis = sma(df['close'], 200)
-    dev = 2 * stdev(df['close'], 200)
-    df['BBupper'] = basis + dev
-    df['BBlower'] = basis - dev
-
-    ult = df.iloc[-1]
-    antepenult = df.iloc[-3]
-
-    puntos_compra = 0
-    puntos_venta = 0
-
-    cond_cocodrilo_up = (
-        (df['close'].iloc[-3] > df['open'].iloc[-3]) and
-        (df['close'].iloc[-2] > df['open'].iloc[-2]) and
-        (df['close'].iloc[-1] > df['open'].iloc[-1]) and
-        (antepenult['low'] <= antepenult['BBlower']) and
-        (ult['vma'] > df['vma'].iloc[-2])
-    )
-    cond_showsignal_up = (oc.iloc[-1] == 1) and (oc.iloc[-2] in [0, -1])
-    cond_nwe_crossover = crossunder(df['close'], df['nwe_lower']).iloc[-1]
-    cond_vma_up = ult['vma'] > df['vma'].iloc[-2]
-
-    puntos_compra = sum([
-        cond_cocodrilo_up * pesos["cocodriloup"],
-        cond_showsignal_up * pesos["showsignal_up"],
-        cond_nwe_crossover * pesos["nwe_crossover"],
-        cond_vma_up * pesos["vma_trend_up"]
-    ])
-
-    cond_cocodrilo_dn = (
-        (df['close'].iloc[-3] < df['open'].iloc[-3]) and
-        (df['close'].iloc[-2] < df['open'].iloc[-2]) and
-        (df['close'].iloc[-1] < df['open'].iloc[-1]) and
-        (antepenult['high'] >= antepenult['BBupper']) and
-        (ult['vma'] < df['vma'].iloc[-2])
-    )
-    cond_showsignal_dn = (oc.iloc[-1] == -1) and (oc.iloc[-2] in [0, 1])
-    cond_nwe_crossunder = crossover(df['close'], df['nwe_upper']).iloc[-1]
-    cond_vma_dn = ult['vma'] < df['vma'].iloc[-2]
-
-    puntos_venta = sum([
-        cond_cocodrilo_dn * pesos["cocodrilodn"],
-        cond_showsignal_dn * pesos["showsignal_down"],
-        cond_nwe_crossunder * pesos["nwe_crossunder"],
-        cond_vma_dn * pesos["vma_trend_down"]
-    ])
-
-    return {"compra": puntos_compra, "venta": puntos_venta}
-    
-    # === Telegram Setup ===
-from telegram import Bot
-
-TELEGRAM_TOKEN = "7969091726:AAFVTZAlWN0aA6uMtJgWfnQhzTRD3cpx4wM"
-TELEGRAM_CHAT_ID = 1570204748  
-
-bot = Bot(token=TELEGRAM_TOKEN)
-
-async def enviar_alerta_telegram(mensaje: str):
-    try:
-        await bot.send_message(
-            chat_id=TELEGRAM_CHAT_ID,
-            text=mensaje,
-            parse_mode='Markdown'
-        )
-        print("✅ Alerta enviada por Telegram")
-    except Exception as e:
-        print(f"❌ Error enviando a Telegram: {e}")
+class BinanceCanalRegresionBot:
+    def __init__(self, config):
+        self.config = config
+        self.operaciones_activas = {}  # Diccionario para seguir operaciones activas
+        self.operaciones_cerradas = []  # Historial de operaciones
         
-        # ===============================
-# 💾 Memoria y aprendizaje
-# ===============================
-def cargar_memoria():
-    if not os.path.exists(MEMORIA_FILE):
-        return []
-    try:
-        with open(MEMORIA_FILE, "r") as f:
-            content = f.read().strip()
-            if not content:
-                return []
-            return json.loads(content)
-    except json.JSONDecodeError:
-        print("⚠️ memoria_senales.json vacío o corrupto → creando nuevo")
-        return []
-    except Exception as e:
-        print(f"❌ Error al cargar memoria: {e}")
-        return []
+        self.exchange = ccxt.binance({
+            'apiKey': config.get('api_key', ''),
+            'secret': config.get('api_secret', ''),
+            'enableRateLimit': True,
+            'options': {'defaultType': 'future'},
+        })
+        
+        # Formatear símbolos correctamente para CCXT
+        self.pairs = self.formatear_simbolos(config['symbols'])
+        
+        logging.info(f"🤖 BOT CANAL REGRESIÓN INICIADO")
+        logging.info(f"📈 Estrategia: LONG/SHORT en toques de canal")
+        logging.info(f"⏰ Scan cada: {config['scan_interval_minutes']}min | Símbolos: {len(self.pairs)}")
 
-def guardar_memoria(memoria):
-    with open(MEMORIA_FILE, "w") as f:
-        json.dump(memoria, f, indent=2, default=str)
-
-def evaluar_resultados(memoria):
-    """Evalúa si las señales pasadas fueron acertadas"""
-    ahora = datetime.now()
-    for registro in memoria:
-        if registro["resultado"] is not None:
-            continue
-
-        ts = datetime.fromisoformat(registro["timestamp"])
-        if (ahora - ts).total_seconds() < EVALUACION_MINUTOS * 60:
-            continue
-
+    def enviar_telegram(self, mensaje):
+        """Envía mensaje a Telegram"""
+        token = self.config.get('telegram_token')
+        chat_id = self.config.get('telegram_chat_id')
+        
+        if not token or not chat_id:
+            return False
+            
         try:
-            df = descargar_datos(registro["symbol"], "15m", 50)
-            if df is None or len(df) < 10:
-                continue
-
-            precio_entrada = registro["precio_entrada"]
-            ult_precio = df['close'].iloc[-1]
-
-            if registro["tipo"] == "COMPRA":
-                registro["resultado"] = "GANANCIA" if ult_precio > precio_entrada else "PÉRDIDA"
-            elif registro["tipo"] == "VENTA":
-                registro["resultado"] = "GANANCIA" if ult_precio < precio_entrada else "PÉRDIDA"
-
+            url = f"https://api.telegram.org/bot{token}/sendMessage"
+            payload = {
+                'chat_id': chat_id,
+                'text': mensaje,
+                'parse_mode': 'HTML'
+            }
+            response = requests.post(url, data=payload, timeout=10)
+            return response.status_code == 200
         except Exception as e:
-            print(f"❌ Error evaluando resultado: {e}")
+            logging.error(f"❌ Error enviando Telegram: {e}")
+            return False
 
-    guardar_memoria(memoria)
+    def formatear_simbolos(self, symbols):
+        """Formatea correctamente los símbolos para CCXT"""
+        pairs_formateados = []
+        for symbol in symbols:
+            # Limpiar y formatear símbolo
+            symbol_clean = symbol.upper().replace(' ', '').replace('/', '')
+            
+            # Corregir MATIC y otros símbolos comunes
+            if 'MATIC' in symbol_clean and 'USDT' not in symbol_clean:
+                symbol_clean = 'MATICUSDT'
+            elif 'BTC' in symbol_clean and 'USDT' not in symbol_clean:
+                symbol_clean = 'BTCUSDT'
+            elif 'ETH' in symbol_clean and 'USDT' not in symbol_clean:
+                symbol_clean = 'ETHUSDT'
+                
+            # Formato CCXT para futuros: "ADA/USDT:USDT"
+            if symbol_clean.endswith('USDT'):
+                base = symbol_clean.replace('USDT', '')
+                pairs_formateados.append(f"{base}/USDT:USDT")
+            else:
+                pairs_formateados.append(f"{symbol_clean}/USDT:USDT")
+                
+        return pairs_formateados
 
-def ajustar_pesos(memoria, pesos):
-    """Ajusta pesos basado en precisión histórica"""
-    aciertos = {
-        "cocodriloup": {"ganancia": 0, "total": 0},
-        "showsignal_up": {"ganancia": 0, "total": 0},
-        "nwe_crossover": {"ganancia": 0, "total": 0},
-        "vma_trend_up": {"ganancia": 0, "total": 0},
-        "cocodrilodn": {"ganancia": 0, "total": 0},
-        "showsignal_down": {"ganancia": 0, "total": 0},
-        "nwe_crossunder": {"ganancia": 0, "total": 0},
-        "vma_trend_down": {"ganancia": 0, "total": 0}
-    }
+    def obtener_precio_actual(self, symbol):
+        """Obtiene el precio actual de un símbolo"""
+        try:
+            ticker = self.exchange.fetch_ticker(symbol)
+            return ticker['last']
+        except Exception as e:
+            logging.error(f"Error obteniendo precio {symbol}: {e}")
+            return None
 
-    for reg in memoria[-100:]:
-        tipo = reg["tipo"].lower()
-        res = reg.get("resultado")
-        if res is None:
-            continue
-
-        if tipo == "compra":
-            aciertos["cocodriloup"]["total"] += 1
-            aciertos["showsignal_up"]["total"] += 1
-            aciertos["nwe_crossover"]["total"] += 1
-            aciertos["vma_trend_up"]["total"] += 1
-            if res == "GANANCIA":
-                aciertos["cocodriloup"]["ganancia"] += 1
-                aciertos["showsignal_up"]["ganancia"] += 1
-                aciertos["nwe_crossover"]["ganancia"] += 1
-                aciertos["vma_trend_up"]["ganancia"] += 1
-
-        elif tipo == "venta":
-            aciertos["cocodrilodn"]["total"] += 1
-            aciertos["showsignal_down"]["total"] += 1
-            aciertos["nwe_crossunder"]["total"] += 1
-            aciertos["vma_trend_down"]["total"] += 1
-            if res == "GANANCIA":
-                aciertos["cocodrilodn"]["ganancia"] += 1
-                aciertos["showsignal_down"]["ganancia"] += 1
-                aciertos["nwe_crossunder"]["ganancia"] += 1
-                aciertos["vma_trend_down"]["ganancia"] += 1
-
-    for key in pesos:
-        total = aciertos[key]["total"]
-        ganancia = aciertos[key]["ganancia"]
-        precision = ganancia / total if total > 0 else 0.5
-
-        if precision < 0.5:
-            pesos[key] *= 0.95  # Penalizar
-        elif precision > 0.7:
-            pesos[key] *= 1.05  # Reforzar
-
-    print("🧠 Pesos ajustados según rendimiento reciente")
-    # ===============================
-# 🔁 Análisis principal
-# ===============================
-def ejecutar_analisis():
-    print(f"\n📆 [{datetime.now().strftime('%Y-%m-%d %H:%M')}] Iniciando análisis...")
-    
-    memoria = cargar_memoria()
-    evaluar_resultados(memoria)
-
-    pesos = {
-        "cocodriloup": 3.0,
-        "showsignal_up": 2.0,
-        "nwe_crossover": 2.0,
-        "vma_trend_up": 1.0,
-        "cocodrilodn": 3.0,
-        "showsignal_down": 2.0,
-        "nwe_crossunder": 2.0,
-        "vma_trend_down": 1.0
-    }
-    ajustar_pesos(memoria, pesos)
-
-    for symbol in SYMBOLS:
-        print(f"\n🔍 Analizando {symbol}...")
-        puntaje_total_compra = 0
-        puntaje_total_venta = 0
-        detalles = []
-        precio_actual = None
-
-        for tf in TIMEFRAMES:
-            df = descargar_datos(symbol, tf, DATA_LIMIT)
-            if df is None or len(df) < 200:
+    def verificar_sl_tp(self):
+        """Verifica si alguna operación activa alcanzó SL o TP"""
+        if not self.operaciones_activas:
+            return
+        
+        operaciones_cerrar = []
+        
+        for op_id, operacion in self.operaciones_activas.items():
+            symbol = operacion['symbol']
+            precio_actual = self.obtener_precio_actual(symbol)
+            
+            if not precio_actual:
                 continue
+            
+            sl = operacion['sl']
+            tp = operacion['tp']
+            señal = operacion['señal']
+            precio_entrada = operacion['precio_entrada']
+            
+            # Verificar si se alcanzó SL o TP
+            if señal == 'LONG':
+                if precio_actual <= sl:
+                    resultado = 'SL'
+                    pnl_percent = ((precio_actual - precio_entrada) / precio_entrada) * 100
+                elif precio_actual >= tp:
+                    resultado = 'TP'
+                    pnl_percent = ((precio_actual - precio_entrada) / precio_entrada) * 100
+                else:
+                    continue
+                    
+            else:  # SHORT
+                if precio_actual >= sl:
+                    resultado = 'SL'
+                    pnl_percent = ((precio_entrada - precio_actual) / precio_entrada) * 100
+                elif precio_actual <= tp:
+                    resultado = 'TP'
+                    pnl_percent = ((precio_entrada - precio_actual) / precio_entrada) * 100
+                else:
+                    continue
+            
+            # Operación a cerrar
+            operacion['precio_salida'] = precio_actual
+            operacion['resultado'] = resultado
+            operacion['pnl_percent'] = pnl_percent
+            operacion['fecha_salida'] = datetime.now().isoformat()
+            
+            operaciones_cerrar.append(op_id)
+            
+            # Enviar notificación
+            emoji = "🔴" if resultado == 'SL' else "🟢"
+            mensaje = f"""{emoji} <b>OPERACIÓN CERRADA - {resultado}</b>
 
-            puntajes = calcular_puntaje_senal(df, pesos)
-            precio_actual = df['close'].iloc[-1]
-            puntaje_total_compra += puntajes["compra"]
-            puntaje_total_venta += puntajes["venta"]
+📊 Par: {symbol}
+🎯 Dirección: {señal}
+💰 Entrada: {precio_entrada:.4f}
+💸 Salida: {precio_actual:.4f}
+🛡️ SL: {sl:.4f}
+🎯 TP: {tp:.4f}
 
-            detalles.append({
-                "tf": tf,
-                "compra": puntajes["compra"],
-                "venta": puntajes["venta"],
-                "precio": float(precio_actual)
-            })
+📈 PnL: {pnl_percent:+.2f}%"""
 
-        if precio_actual is None:
-            continue
+            if self.enviar_telegram(mensaje):
+                logging.info(f"✅ Notificación {resultado} enviada a Telegram")
+            else:
+                logging.info(f"📢 Operación cerrada por {resultado} | PnL: {pnl_percent:+.2f}%")
+        
+        # Cerrar operaciones
+        for op_id in operaciones_cerrar:
+            operacion_cerrada = self.operaciones_activas.pop(op_id)
+            self.operaciones_cerradas.append(operacion_cerrada)
 
-        if puntaje_total_compra >= UMBRAL_CONFLUENCIA and puntaje_total_compra > puntaje_total_venta:
-            stop_loss = precio_actual * 0.99
-            mensaje = f"""
-🟢 *SEÑAL DE COMPRA CONFLUENTE*
-──────────────────────────────
-*Par:* `{symbol}`
-*Precio de entrada:* `${precio_actual:,.6f}`
-*Stop Loss (1%):* `${stop_loss:,.6f}`
-*Puntaje total:* `{puntaje_total_compra:.1f}`
-*Timeframes activos:* `{[d['tf'] for d in detalles if d['compra'] > 0]}`
-*Fecha:* {datetime.now().strftime('%Y-%m-%d %H:%M')}
-"""
-            print(mensaje.strip())
+    def calcular_canal_regresion(self, df):
+        """Calcula el canal de regresión lineal"""
+        length = self.config['regression_length']
+        
+        if len(df) < length:
+            return None, None, None, 0, 0
+        
+        # Tomar los últimos precios
+        prices = df['close'].tail(length).values
+        
+        # Array de tiempo
+        x = np.arange(len(prices))
+        
+        # Regresión lineal del cierre
+        slope, intercept = np.polyfit(x, prices, 1)
+        
+        # Calcular canal: línea central + desviación estándar
+        regression_line = slope * x + intercept
+        residuals = prices - regression_line
+        std_dev = np.std(residuals)
+        
+        # Líneas del canal
+        upper_band = regression_line + std_dev
+        lower_band = regression_line - std_dev
+        
+        # Ángulo de tendencia
+        angle = np.degrees(np.arctan(slope / np.mean(prices)))
+        
+        return upper_band, regression_line, lower_band, angle, slope
 
-            # Enviar por Telegram
-            asyncio.run(enviar_alerta_telegram(mensaje))
+    def precio_toca_canal(self, precio_actual, upper_band, lower_band):
+        """Verifica si el precio toca el canal"""
+        threshold_percent = self.config['touch_threshold'] / 100
+        current_upper = upper_band[-1]
+        current_lower = lower_band[-1]
+        
+        # Verificar toque en parte superior
+        touch_upper = abs(precio_actual - current_upper) / current_upper <= threshold_percent
+        
+        # Verificar toque en parte inferior  
+        touch_lower = abs(precio_actual - current_lower) / current_lower <= threshold_percent
+        
+        return touch_upper, touch_lower
 
-            memoria.append({
-                "symbol": symbol,
-                "tipo": "COMPRA",
-                "precio_entrada": precio_actual,
-                "stop_loss": stop_loss,
-                "timeframes": [d['tf'] for d in detalles if d['compra'] > 0],
-                "puntaje": puntaje_total_compra,
-                "timestamp": datetime.now().isoformat(),
-                "resultado": None
-            })
+    def calcular_sl_tp_canal(self, señal, precio_entrada, upper_band, lower_band):
+        """Calcula SL y TP basado en el canal"""
+        current_upper = upper_band[-1]
+        current_lower = lower_band[-1]
+        sl_percentage = self.config['sl_percentage'] / 100
+        
+        if señal == 'LONG':
+            # SL: 1% por debajo del canal inferior
+            sl_price = current_lower * (1 - sl_percentage)
+            # TP: Parte superior del canal
+            tp_price = current_upper
+            
+        else:  # SHORT
+            # SL: 1% por encima del canal superior
+            sl_price = current_upper * (1 + sl_percentage)
+            # TP: Parte inferior del canal  
+            tp_price = current_lower
+        
+        return sl_price, tp_price
 
-        elif puntaje_total_venta >= UMBRAL_CONFLUENCIA and puntaje_total_venta > puntaje_total_compra:
-            stop_loss = precio_actual * 1.01
-            mensaje = f"""
-🔴 *SEÑAL DE VENTA CONFLUENTE*
-──────────────────────────────
-*Par:* `{symbol}`
-*Precio de entrada:* `${precio_actual:,.6f}`
-*Stop Loss (1%):* `${stop_loss:,.6f}`
-*Puntaje total:* `{puntaje_total_venta:.1f}`
-*Timeframes activos:* `{[d['tf'] for d in detalles if d['venta'] > 0]}`
-*Fecha:* {datetime.now().strftime('%Y-%m-%d %H:%M')}
-"""
-            print(mensaje.strip())
+    def obtener_datos_futuros(self, symbol):
+        """Obtiene datos de futuros"""
+        try:
+            total_bars = self.config['regression_length'] + 50
+            
+            ohlcv = self.exchange.fetch_ohlcv(
+                symbol, 
+                self.config['timeframe'], 
+                limit=total_bars
+            )
+            
+            if len(ohlcv) == 0:
+                return None
+                
+            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+            return df
+            
+        except Exception as e:
+            logging.error(f"    {symbol}...    ERROR: {str(e)}")
+            return None
 
-            # Enviar por Telegram
-            asyncio.run(enviar_alerta_telegram(mensaje))
+    def analizar_par(self, symbol):
+        """Analiza si hay señal en el canal de regresión"""
+        # Verificar si ya tenemos una operación activa en este par
+        for op in self.operaciones_activas.values():
+            if op['symbol'] == symbol:
+                return None  # Ya hay operación activa en este par
+        
+        df = self.obtener_datos_futuros(symbol)
+        
+        if df is None or len(df) < self.config['regression_length']:
+            return None
+        
+        # Calcular canal de regresión
+        upper_band, midline, lower_band, angle, slope = self.calcular_canal_regresion(df)
+        
+        if upper_band is None:
+            return None
+        
+        # Verificar tendencia significativa
+        if abs(angle) < self.config['min_trend_angle']:
+            return None  # Canal muy plano, ignorar
+        
+        # Filtrar por volumen
+        avg_volume = df['volume'].tail(20).mean()
+        if avg_volume < self.config['min_volume']:
+            return None
+        
+        # Precio actual
+        precio_actual = df['close'].iloc[-1]
+        
+        # Verificar toques del canal
+        touch_upper, touch_lower = self.precio_toca_canal(precio_actual, upper_band, lower_band)
+        
+        señal = None
+        
+        # SEÑAL LONG: Canal ALCISTA + Toca parte INFERIOR
+        if slope > 0 and touch_lower:
+            señal = 'LONG'
+            
+        # SEÑAL SHORT: Canal BAJISTA + Toca parte SUPERIOR  
+        elif slope < 0 and touch_upper:
+            señal = 'SHORT'
+        
+        if señal:
+            # Calcular SL y TP
+            sl_price, tp_price = self.calcular_sl_tp_canal(señal, precio_actual, upper_band, lower_band)
+            
+            # Calcular riesgo y reward
+            if señal == 'LONG':
+                riesgo = precio_actual - sl_price
+                reward = tp_price - precio_actual
+            else:
+                riesgo = sl_price - precio_actual  
+                reward = precio_actual - tp_price
+            
+            risk_reward = reward / riesgo if riesgo > 0 else 0
+            
+            # Crear operación
+            operacion_id = f"{symbol}_{int(time.time())}"
+            operacion = {
+                'id': operacion_id,
+                'symbol': symbol,
+                'señal': señal,
+                'precio_entrada': precio_actual,
+                'sl': sl_price,
+                'tp': tp_price,
+                'risk_reward': risk_reward,
+                'angulo_canal': angle,
+                'pendiente': slope,
+                'volumen': avg_volume,
+                'tipo_canal': 'ALCISTA' if slope > 0 else 'BAJISTA',
+                'fecha_entrada': datetime.now().isoformat()
+            }
+            
+            # Enviar notificación de entrada
+            mensaje_entrada = f"""🎯 <b>NUEVA SEÑAL - {señal}</b>
 
-            memoria.append({
-                "symbol": symbol,
-                "tipo": "VENTA",
-                "precio_entrada": precio_actual,
-                "stop_loss": stop_loss,
-                "timeframes": [d['tf'] for d in detalles if d['venta'] > 0],
-                "puntaje": puntaje_total_venta,
-                "timestamp": datetime.now().isoformat(),
-                "resultado": None
-            })
-        else:
-            print(f"🟡 Sin señal clara para {symbol}")
+📊 Par: {symbol}
+💰 Precio: {precio_actual:.4f}
+🛡️ SL: {sl_price:.4f}
+🎯 TP: {tp_price:.4f}
+📊 R/R: {risk_reward:.2f}
+📈 Ángulo: {angle:.2f}°
+🔢 Canal: {self.config['regression_length']} velas"""
 
-    guardar_memoria(memoria)
+            if self.enviar_telegram(mensaje_entrada):
+                logging.info(f"✅ Notificación entrada enviada a Telegram")
+            
+            return operacion
+        
+        return None
 
-# ===============================
-# ▶️ Ejecución automática
-# ===============================
-if __name__ == "__main__":
-    # Crear archivo de memoria si no existe
-    if not os.path.exists(MEMORIA_FILE):
-        with open(MEMORIA_FILE, "w") as f:
-            f.write("[]")
+    def obtener_estadisticas(self):
+        """Calcula estadísticas de las operaciones"""
+        if not self.operaciones_cerradas:
+            return "Sin operaciones cerradas"
+        
+        total_ops = len(self.operaciones_cerradas)
+        ops_ganadoras = sum(1 for op in self.operaciones_cerradas if op['resultado'] == 'TP')
+        ops_perdedoras = sum(1 for op in self.operaciones_cerradas if op['resultado'] == 'SL')
+        win_rate = (ops_ganadoras / total_ops) * 100 if total_ops > 0 else 0
+        
+        pnl_total = sum(op['pnl_percent'] for op in self.operaciones_cerradas)
+        
+        return f"Win Rate: {win_rate:.1f}% | Ops: {total_ops} | PnL: {pnl_total:+.2f}%"
 
-    print("🤖 Bot inteligente iniciado")
-    ejecutar_analisis()
-    schedule.every(15).minutes.do(ejecutar_analisis)
-    schedule.every().hour.do(lambda: evaluar_resultados(cargar_memoria()))
+    def ejecutar_analisis(self):
+        """Ejecuta análisis completo"""
+        # Primero verificar SL/TP de operaciones activas
+        self.verificar_sl_tp()
+        
+        logging.info(f"ANALISIS CANAL REGRESIÓN - {self.config['modalidad'].upper()}")
+        logging.info(f"Config: {self.config['regression_length']} velas | SL {self.config['sl_percentage']}% | Scan: {self.config['scan_interval_minutes']}min")
+        logging.info(f"Ops activas: {len(self.operaciones_activas)} | {self.obtener_estadisticas()}")
+        logging.info("=" * 70)
+        
+        señales = 0
+        symbols_scanned = 0
+        
+        for pair in self.pairs[:self.config['max_symbols_to_scan']]:
+            operacion = self.analizar_par(pair)
+            symbols_scanned += 1
+            
+            if operacion:
+                # Agregar operación a activas
+                self.operaciones_activas[operacion['id']] = operacion
+                
+                logging.info(f"    {pair}...    SEÑAL {operacion['señal']} | Canal {operacion['tipo_canal']}")
+                logging.info(f"        💰 Entrada: {operacion['precio_entrada']:.4f}")
+                logging.info(f"        🛡️  SL: {operacion['sl']:.4f} | 🎯 TP: {operacion['tp']:.4f}")
+                logging.info(f"        📊 R/R: {operacion['risk_reward']:.2f} | Ángulo: {operacion['angulo_canal']:.2f}°")
+                señales += 1
+            else:
+                logging.info(f"    {pair}...    Sin señal")
+        
+        logging.info(f"ANALISIS COMPLETADO. Escaneados: {symbols_scanned} | Nuevas señales: {señales}")
+        logging.info(f"Ops activas total: {len(self.operaciones_activas)}")
+        logging.info(f"Próximo análisis en {self.config['scan_interval_minutes']} minutos")
+        logging.info("")
+
+def cargar_configuracion():
+    """Carga la configuración desde archivo"""
+    try:
+        with open('config_binance_canal.json', 'r') as f:
+            return json.load(f)
+    except FileNotFoundError:
+        print("❌ No se encontró config_binance_canal.json - Ejecuta el configurador primero")
+        return None
+
+def main():
+    config = cargar_configuracion()
+    if not config:
+        return
+    
+    bot = BinanceCanalRegresionBot(config)
     
     while True:
-        schedule.run_pending()
-        time.sleep(10)
-    
+        try:
+            bot.ejecutar_analisis()
+            time.sleep(config['scan_interval_minutes'] * 60)
+            
+        except KeyboardInterrupt:
+            logging.info("Deteniendo bot...")
+            break
+        except Exception as e:
+            logging.error(f"Error general: {e}")
+            time.sleep(60)
+
+if __name__ == "__main__":
+    main()
     
