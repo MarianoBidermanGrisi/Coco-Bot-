@@ -22,7 +22,6 @@ from flask import Flask, request, jsonify
 import threading
 import logging
 
-
 # --- NUEVA LÓGICA DE TRADING ---
 # Importar el módulo de trading de Binance
 from binance_trader import BinanceTrader
@@ -488,8 +487,10 @@ class TradingBot:
 👁️ Máximo 30 minutos para confirmación
 📍 {expectativa}
         """
-        token = self.config.get('8556665998:AAF5V6gtuLJkCAPvUB5ltac5u6Uv9fci0Ns')
-        chat_ids = self.config.get('126746393', [])
+        # CORRECCIÓN: Leer credenciales desde la configuración (que vienen de variables de entorno)
+        token = self.config.get('telegram_token')
+        chat_ids = self.config.get('telegram_chat_ids', [])
+        
         if token and chat_ids:
             try:
                 print(f"     📊 Generando gráfico de breakout para {simbolo}...")
@@ -885,8 +886,10 @@ class TradingBot:
 ⏰ <b>Hora:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 💡 <b>Estrategia:</b> BREAKOUT + REENTRY con confirmación Stochastic
         """
+        # CORRECCIÓN: Leer credenciales desde la configuración
         token = self.config.get('telegram_token')
         chat_ids = self.config.get('telegram_chat_ids', [])
+
         if token and chat_ids:
             try:
                 print(f"     📊 Generando gráfico para {simbolo}...")
@@ -1291,10 +1294,8 @@ app = Flask(__name__)
 config = {
     'telegram_token': os.getenv('TELEGRAM_TOKEN'),
     'telegram_chat_ids': os.getenv('TELEGRAM_CHAT_ID', '').split(','),
-    'symbols': os.getenv('SYMBOLS', 'BTCUSDT,ETHUSDT','DOTUSDT','LINKUSDT','BNBUSDT','XRPUSDT','SOLUSDT','AVAXUSDT',
-            'DOGEUSDT','LTCUSDT','ATOMUSDT','XLMUSDT','ALGOUSDT','VETUSDT','ICPUSDT','FILUSDT',
-            'BCHUSDT','EOSUSDT','TRXUSDT','XTZUSDT','SUSHIUSDT','COMPUSDT','YFIUSDT','ETCUSDT',
-            'SNXUSDT','RENUSDT','1INCHUSDT','NEOUSDT','ZILUSDT','HOTUSDT','ENJUSDT','ZECUSDT').split(','),
+    # CORRECCIÓN: Poner todos los símbolos en una sola cadena por defecto
+    'symbols': os.getenv('SYMBOLS', 'BTCUSDT,ETHUSDT,DOTUSDT,LINKUSDT,BNBUSDT,XRPUSDT,SOLUSDT,AVAXUSDT,DOGEUSDT,LTCUSDT,ATOMUSDT,XLMUSDT,ALGOUSDT,VETUSDT,ICPUSDT,FILUSDT,BCHUSDT,EOSUSDT,TRXUSDT,XTZUSDT,SUSHIUSDT,COMPUSDT,YFIUSDT,ETCUSDT,SNXUSDT,RENUSDT,1INCHUSDT,NEOUSDT,ZILUSDT,HOTUSDT,ENJUSDT,ZECUSDT').split(','),
     'log_path': 'operaciones_log.csv',
     'estado_file': 'estado_bot.json',
     'min_channel_width_percent': 4.0,
@@ -1319,3 +1320,4 @@ def run_bot():
 if __name__ == '__main__':
     # Este bloque es para ejecución local y no se usa en Render
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
+
