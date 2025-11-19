@@ -1291,7 +1291,10 @@ app = Flask(__name__)
 config = {
     'telegram_token': os.getenv('TELEGRAM_TOKEN'),
     'telegram_chat_ids': os.getenv('TELEGRAM_CHAT_ID', '').split(','),
-    'symbols': os.getenv('SYMBOLS', 'BTCUSDT,ETHUSDT').split(','),
+    'symbols': os.getenv('SYMBOLS', 'BTCUSDT,ETHUSDT','DOTUSDT','LINKUSDT','BNBUSDT','XRPUSDT','SOLUSDT','AVAXUSDT',
+            'DOGEUSDT','LTCUSDT','ATOMUSDT','XLMUSDT','ALGOUSDT','VETUSDT','ICPUSDT','FILUSDT',
+            'BCHUSDT','EOSUSDT','TRXUSDT','XTZUSDT','SUSHIUSDT','COMPUSDT','YFIUSDT','ETCUSDT',
+            'SNXUSDT','RENUSDT','1INCHUSDT','NEOUSDT','ZILUSDT','HOTUSDT','ENJUSDT','ZECUSDT').split(','),
     'log_path': 'operaciones_log.csv',
     'estado_file': 'estado_bot.json',
     'min_channel_width_percent': 4.0,
