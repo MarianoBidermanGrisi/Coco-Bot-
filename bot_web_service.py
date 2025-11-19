@@ -21,6 +21,7 @@ from io import BytesIO
 from flask import Flask, request, jsonify
 import threading
 import logging
+import gc # --- SOLUCIÓN 3: Importar el recolector de basura ---
 
 # --- NUEVA LÓGICA DE TRADING ---
 # Importar el módulo de trading de Binance
@@ -487,10 +488,8 @@ class TradingBot:
 👁️ Máximo 30 minutos para confirmación
 📍 {expectativa}
         """
-        # CORRECCIÓN: Leer credenciales desde la configuración (que vienen de variables de entorno)
         token = self.config.get('telegram_token')
         chat_ids = self.config.get('telegram_chat_ids', [])
-        
         if token and chat_ids:
             try:
                 print(f"     📊 Generando gráfico de breakout para {simbolo}...")
@@ -619,6 +618,7 @@ class TradingBot:
             plt.savefig(buf, format='png', dpi=100, bbox_inches='tight', facecolor='#1a1a1a')
             buf.seek(0)
             plt.close(fig)
+            gc.collect() # --- SOLUCIÓN 3: Liberar memoria explícitamente ---
             return buf
         except Exception as e:
             print(f"⚠️ Error generando gráfico de breakout: {e}")
@@ -886,10 +886,8 @@ class TradingBot:
 ⏰ <b>Hora:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 💡 <b>Estrategia:</b> BREAKOUT + REENTRY con confirmación Stochastic
         """
-        # CORRECCIÓN: Leer credenciales desde la configuración
         token = self.config.get('telegram_token')
         chat_ids = self.config.get('telegram_chat_ids', [])
-
         if token and chat_ids:
             try:
                 print(f"     📊 Generando gráfico para {simbolo}...")
@@ -1260,6 +1258,7 @@ class TradingBot:
             plt.savefig(buf, format='png', dpi=100, bbox_inches='tight', facecolor='#1a1a1a')
             buf.seek(0)
             plt.close(fig)
+            gc.collect() # --- SOLUCIÓN 3: Liberar memoria explícitamente ---
             return buf
         except Exception as e:
             print(f"⚠️ Error generando gráfico: {e}")
@@ -1320,4 +1319,3 @@ def run_bot():
 if __name__ == '__main__':
     # Este bloque es para ejecución local y no se usa en Render
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
-
