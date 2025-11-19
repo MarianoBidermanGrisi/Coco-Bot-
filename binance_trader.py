@@ -6,7 +6,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 class BinanceTrader:
-    def __init__(self, GW39XHiDenV2XCkLm6GBRwS8q285vHuB8IpiSaqeO5adBEZWOHXliHuqF7Yvzjex, vKESBt2VWW0HitIimiFi4WB1pzkSHpGcTJOLaIYeqo4ndzwOWs3gmEYjUS8oSO69, testnet=True):
+    def __init__(self, api_key, secret_key, testnet=True):
         """
         Inicializa el cliente de Binance.
         :param api_key: Tu API Key de Binance.
