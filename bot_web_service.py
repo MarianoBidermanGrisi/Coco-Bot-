@@ -1,5 +1,5 @@
 # bot_web_service.py
-# Adaptación para Render + Binance Testnet + sin gráficos
+# Adaptación para Render + Binance Testnet + sin gráficos + Diagnóstico de Telegram
 import requests
 import time
 import json
@@ -105,7 +105,6 @@ class BinanceTrader:
     # FUNCIÓN CORREGIDA: Redondear el stop_price
     def place_stop_loss_order(self, symbol, side, stop_price):
         try:
-            # 🔑 CORRECCIÓN: Redondear el precio al número de decimales permitido
             precision = self.get_price_precision(symbol)
             stop_price = round(stop_price, precision)
             logger_binance.info(f"🛑 Colocando STOP_MARKET: {side} en {symbol} a {stop_price} (precisión: {precision})")
@@ -129,13 +128,14 @@ logging.basicConfig(level=logging.INFO, stream=sys.stdout, format='%(asctime)s -
 logger = logging.getLogger(__name__)
 
 # ---------------------------
-# Optimizador IA (sin cambios)
+# Optimizador IA
 # ---------------------------
 class OptimizadorIA:
     def __init__(self, log_path="operaciones_log.csv", min_samples=15):
         self.log_path = log_path
         self.min_samples = min_samples
         self.datos = self.cargar_datos()
+
     def cargar_datos(self):
         datos = []
         try:
@@ -162,6 +162,7 @@ class OptimizadorIA:
         except FileNotFoundError:
             print("⚠ No se encontró operaciones_log.csv (optimizador)")
         return datos
+
     def evaluar_configuracion(self, trend_threshold, min_strength, entry_margin):
         if not self.datos:
             return -99999
@@ -185,6 +186,7 @@ class OptimizadorIA:
         if ops_calidad:
             score *= 1.2
         return score
+
     def buscar_mejores_parametros(self):
         if not self.datos or len(self.datos) < self.min_samples:
             print(f"ℹ️ No hay suficientes datos para optimizar (se requieren {self.min_samples}, hay {len(self.datos)})")
@@ -587,7 +589,6 @@ class TradingBot:
         balance = float(info_cuenta['availableBalance'])
         monto_usdt = balance * 0.01  # 1%
         cantidad_base = monto_usdt / precio_entrada
-        # Ajustar al stepSize del contrato
         symbol_info = self.trader.get_symbol_info(symbol)
         if not symbol_info:
             return None
@@ -609,22 +610,18 @@ class TradingBot:
         if not self.trader:
             print("❌ Trader no disponible. Operación omitida.")
             return False
-        # Establecer apalancamiento 5x
         if not self.trader.set_leverage(simbolo, 5):
             print(f"❌ Falló al establecer apalancamiento 5x para {simbolo}")
             return False
-        # Calcular cantidad
         cantidad = self.calcular_tamaño_posicion(simbolo, precio_entrada)
         if not cantidad:
             print(f"❌ No se pudo calcular cantidad para {simbolo}")
             return False
-        # Abrir posición
         side = 'BUY' if tipo_operacion == 'LONG' else 'SELL'
         orden = self.trader.place_market_order(simbolo, side, cantidad)
         if not orden:
             print(f"❌ Falló al abrir posición {tipo_operacion} en {simbolo}")
             return False
-        # Colocar stop-loss
         sl_side = 'SELL' if tipo_operacion == 'LONG' else 'BUY'
         self.trader.place_stop_loss_order(simbolo, sl_side, sl)
         return True
@@ -673,7 +670,6 @@ class TradingBot:
                 precio_entrada, tp, sl = self.calcular_niveles_entrada(
                     tipo_operacion, info_canal, datos_mercado['precio_actual']
                 )
-                # 🔑 CORRECCIÓN: Asegurar que sl se redondea antes de usarlo
                 if not precio_entrada or not tp or not sl:
                     continue
                 if simbolo in self.breakout_history:
@@ -681,7 +677,6 @@ class TradingBot:
                     tiempo_desde_ultimo = (datetime.now() - ultimo_breakout).total_seconds() / 3600
                     if tiempo_desde_ultimo < 2:
                         continue
-                # Ejecutar operación en Binance
                 if self.ejecutar_operacion_binance(simbolo, tipo_operacion, precio_entrada, sl):
                     self.generar_senal_operacion(
                         simbolo, tipo_operacion, precio_entrada, tp, sl, 
@@ -1121,17 +1116,30 @@ class TradingBot:
         return 1 - (ss_res / ss_tot)
 
     # Eliminadas: generar_grafico_profesional, generar_grafico_breakout, enviar_grafico_telegram
+
+    # NUEVA FUNCIÓN: Diagnóstico explícito para Telegram
     def _enviar_telegram_simple(self, mensaje, token, chat_ids):
-        if not token or not chat_ids:
+        if not token:
+            print("⚠️ TELEGRAM_TOKEN no está definido en las variables de entorno.")
             return False
+        if not chat_ids:
+            print("⚠️ TELEGRAM_CHAT_ID no está definido en las variables de entorno.")
+            return False
+        print(f"📡 Enviando mensaje a Telegram (Chat IDs: {chat_ids})...")
         resultados = []
         for chat_id in chat_ids:
             url = f"https://api.telegram.org/bot{token}/sendMessage"
             payload = {'chat_id': chat_id, 'text': mensaje, 'parse_mode': 'HTML'}
             try:
                 r = requests.post(url, json=payload, timeout=10)
-                resultados.append(r.status_code == 200)
-            except Exception:
+                if r.status_code == 200:
+                    print(f"✅ Mensaje enviado exitosamente al chat {chat_id}.")
+                    resultados.append(True)
+                else:
+                    print(f"❌ Error al enviar a {chat_id}: {r.status_code} - {r.text}")
+                    resultados.append(False)
+            except Exception as e:
+                print(f"❌ Excepción al enviar a {chat_id}: {e}")
                 resultados.append(False)
         return any(resultados)
 
