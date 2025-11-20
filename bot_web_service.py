@@ -72,6 +72,21 @@ class BinanceTrader:
             logger_binance.error(f"❌ Error al obtener info del símbolo {symbol}: {e}")
             return None
 
+    # NUEVA FUNCIÓN: Obtener la precisión del precio
+    def get_price_precision(self, symbol):
+        try:
+            info = self.client.futures_exchange_info()
+            for s in info['symbols']:
+                if s['symbol'] == symbol:
+                    for f in s['filters']:
+                        if f['filterType'] == 'PRICE_FILTER':
+                            min_price = float(f['minPrice'])
+                            return int(-math.log10(min_price))
+            return 8  # fallback
+        except Exception as e:
+            logger_binance.error(f"Error obteniendo precisión para {symbol}: {e}")
+            return 8
+
     def place_market_order(self, symbol, side, quantity):
         try:
             logger_binance.info(f"📈 Enviando orden MARKET: {side} {quantity} {symbol}")
@@ -87,9 +102,13 @@ class BinanceTrader:
             logger_binance.error(f"❌ Error al colocar orden: {e}")
             return None
 
+    # FUNCIÓN CORREGIDA: Redondear el stop_price
     def place_stop_loss_order(self, symbol, side, stop_price):
         try:
-            logger_binance.info(f"🛑 Colocando STOP_MARKET: {side} en {symbol} a {stop_price}")
+            # 🔑 CORRECCIÓN: Redondear el precio al número de decimales permitido
+            precision = self.get_price_precision(symbol)
+            stop_price = round(stop_price, precision)
+            logger_binance.info(f"🛑 Colocando STOP_MARKET: {side} en {symbol} a {stop_price} (precisión: {precision})")
             order = self.client.futures_create_order(
                 symbol=symbol,
                 side=side,
@@ -654,6 +673,7 @@ class TradingBot:
                 precio_entrada, tp, sl = self.calcular_niveles_entrada(
                     tipo_operacion, info_canal, datos_mercado['precio_actual']
                 )
+                # 🔑 CORRECCIÓN: Asegurar que sl se redondea antes de usarlo
                 if not precio_entrada or not tp or not sl:
                     continue
                 if simbolo in self.breakout_history:
@@ -1101,7 +1121,6 @@ class TradingBot:
         return 1 - (ss_res / ss_tot)
 
     # Eliminadas: generar_grafico_profesional, generar_grafico_breakout, enviar_grafico_telegram
-
     def _enviar_telegram_simple(self, mensaje, token, chat_ids):
         if not token or not chat_ids:
             return False
