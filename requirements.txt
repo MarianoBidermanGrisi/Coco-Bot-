@@ -1,10 +1,6 @@
-# requirements.txt
 Flask==2.3.3
 requests==2.31.0
 numpy==1.26.4
 pandas>=2.2.3
-matplotlib==3.9.0
-mplfinance==0.12.10b0
-python-telegram-bot==21.3
 gunicorn==21.2.0
 python-binance==1.0.19
