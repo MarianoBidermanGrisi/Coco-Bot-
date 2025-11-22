@@ -1,6 +1,6 @@
 # bot_web_service.py
 # Adaptación para Render + Binance Testnet + sin gráficos + Diagnóstico de Telegram
-# ✅ CORREGIDO: cancelación de órdenes huérfanas y notificación de cierres reales
+# ✅ CORREGIDO: órdenes huérfanas, cierres reales, error -2021, notificaciones
 import requests
 import time
 import json
@@ -138,9 +138,28 @@ class BinanceTrader:
             logger_binance.error(f"❌ Error al colocar Take-Profit: {e}")
             return None
 
-    # === NUEVA FUNCIÓN: Cancelar órdenes de cierre pendientes ===
+    # === NUEVA FUNCIÓN: Validar y ajustar SL/TP para evitar error -2021 ===
+    def validar_niveles_sl_tp(self, symbol, side, sl_price, tp_price):
+        try:
+            ticker = self.client.futures_symbol_ticker(symbol=symbol)
+            precio_actual = float(ticker['price'])
+            if side == 'BUY':  # SHORT → SL arriba, TP abajo
+                if sl_price <= precio_actual:
+                    sl_price = precio_actual * 1.005
+                if tp_price >= precio_actual:
+                    tp_price = precio_actual * 0.995
+            else:  # LONG → SL abajo, TP arriba
+                if sl_price >= precio_actual:
+                    sl_price = precio_actual * 0.995
+                if tp_price <= precio_actual:
+                    tp_price = precio_actual * 1.005
+            return sl_price, tp_price
+        except Exception as e:
+            logger_binance.error(f"Error validando SL/TP para {symbol}: {e}")
+            return sl_price, tp_price
+
+    # === NUEVA FUNCIÓN: Cancelar órdenes huérfanas ===
     def cancelar_ordenes_cierre(self, symbol):
-        """Cancela todas las órdenes de tipo STOP_MARKET o TAKE_PROFIT_MARKET para un símbolo."""
         try:
             open_orders = self.client.futures_get_open_orders(symbol=symbol)
             for order in open_orders:
@@ -152,7 +171,6 @@ class BinanceTrader:
 
 # --- FIN MÓDULO BINANCE TRADER ---
 
-# Configurar logging
 logging.basicConfig(level=logging.INFO, stream=sys.stdout, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -269,7 +287,6 @@ class TradingBot:
         self.esperando_reentry = {}
         self.estado_file = config.get('estado_file', 'estado_bot.json')
         self.cargar_estado()
-        # Inicializar BinanceTrader
         self.trader = BinanceTrader(
             api_key=config['binance_api_key'],
             secret_key=config['binance_secret_key'],
@@ -278,7 +295,6 @@ class TradingBot:
         if not self.trader.check_connection():
             print("❌ No se pudo conectar a Binance. El bot no operará.")
             self.trader = None
-        # Optimización inicial
         if self.auto_optimize:
             try:
                 ia = OptimizadorIA(log_path=self.log_path, min_samples=config.get('min_samples_optimizacion', 15))
@@ -612,7 +628,7 @@ class TradingBot:
         if not info_cuenta:
             return None
         balance = float(info_cuenta['availableBalance'])
-        monto_usdt = balance * 0.03  # ✅ CAMBIO: 3% en lugar de 1%
+        monto_usdt = balance * 0.03
         cantidad_base = monto_usdt / precio_entrada
         symbol_info = self.trader.get_symbol_info(symbol)
         if not symbol_info:
@@ -647,10 +663,31 @@ class TradingBot:
         if not orden:
             print(f"❌ Falló al abrir posición {tipo_operacion} en {simbolo}")
             return False
+
+        # 🔁 Validar y ajustar SL/TP para evitar error -2021
         sl_side = 'SELL' if tipo_operacion == 'LONG' else 'BUY'
         tp_side = sl_side
-        self.trader.place_stop_loss_order(simbolo, sl_side, sl)
-        self.trader.place_take_profit_order(simbolo, tp_side, tp)
+        sl_ajustado, tp_ajustado = self.trader.validar_niveles_sl_tp(simbolo, sl_side, sl, tp)
+
+        # Colocar órdenes
+        sl_order = self.trader.place_stop_loss_order(simbolo, sl_side, sl_ajustado)
+        tp_order = self.trader.place_take_profit_order(simbolo, tp_side, tp_ajustado)
+
+        if not sl_order or not tp_order:
+            print(f"⚠️ Al menos una orden de cierre falló en {simbolo}. Verificando estado...")
+            ordenes_activas = self.trader.client.futures_get_open_orders(symbol=simbolo)
+            sl_existe = any(o['type'] == 'STOP_MARKET' for o in ordenes_activas)
+            tp_existe = any(o['type'] == 'TAKE_PROFIT_MARKET' for o in ordenes_activas)
+            if not sl_existe or not tp_existe:
+                print(f"❌ Operación en {simbolo} NO protegida. Cerrando posición inmediatamente.")
+                self.trader.client.futures_create_order(
+                    symbol=simbolo,
+                    side='SELL' if tipo_operacion == 'LONG' else 'BUY',
+                    type='MARKET',
+                    reduceOnly=True
+                )
+                return False
+
         return True
 
     # === FUNCIÓN REEMPLAZADA: verificar_cierre_operaciones mejorada ===
@@ -1063,7 +1100,6 @@ class TradingBot:
         """
         return mensaje
 
-    # Funciones auxiliares sin cambios (stochastic, regresión, etc.)
     def calcular_stochastic(self, datos_mercado, period=14, k_period=3, d_period=3):
         if len(datos_mercado['cierres']) < period:
             return 50, 50
