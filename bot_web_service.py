@@ -2,6 +2,8 @@
 # Adaptación para Render + Binance Testnet + sin gráficos + Diagnóstico de Telegram
 # ✅ CORREGIDO: órdenes huérfanas, cierres reales, error -2021, notificaciones
 # ✅ MODIFICADO: NO abrir nuevas operaciones si ya hay una activa en el mismo símbolo
+# ✅ MODIFICADO: TP/SL usan decimales exactos permitidos por Binance
+# ✅ CORREGIDO: Registro inmediato de operación tras ejecución exitosa (evita duplicados)
 import requests
 import time
 import json
@@ -127,7 +129,6 @@ class BinanceTrader:
         except Exception as e:
             logger_binance.error(f"❌ Error al colocar Take-Profit: {e}")
             return None
-    # === NUEVA FUNCIÓN: Validar y ajustar SL/TP para evitar error -2021 ===
     def validar_niveles_sl_tp(self, symbol, side, sl_price, tp_price):
         try:
             ticker = self.client.futures_symbol_ticker(symbol=symbol)
@@ -146,7 +147,6 @@ class BinanceTrader:
         except Exception as e:
             logger_binance.error(f"Error validando SL/TP para {symbol}: {e}")
             return sl_price, tp_price
-    # === NUEVA FUNCIÓN: Cancelar órdenes huérfanas ===
     def cancelar_ordenes_cierre(self, symbol):
         try:
             open_orders = self.client.futures_get_open_orders(symbol=symbol)
@@ -159,9 +159,7 @@ class BinanceTrader:
 # --- FIN MÓDULO BINANCE TRADER ---
 logging.basicConfig(level=logging.INFO, stream=sys.stdout, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
-# ---------------------------
-# Optimizador IA
-# ---------------------------
+
 class OptimizadorIA:
     def __init__(self, log_path="operaciones_log.csv", min_samples=15):
         self.log_path = log_path
@@ -250,9 +248,7 @@ class OptimizadorIA:
         else:
             print("⚠ No se encontró una configuración mejor")
         return mejores_param
-# ---------------------------
-# BOT PRINCIPAL - BREAKOUT + REENTRY (sin gráficos)
-# ---------------------------
+
 class TradingBot:
     def __init__(self, config):
         self.config = config
@@ -617,29 +613,31 @@ class TradingBot:
             print(f"⚠️ Cantidad ajustada {cantidad_ajustada} es menor que stepSize {step_size} para {symbol}. Operación omitida.")
             return None
         return cantidad_ajustada
+
     def ejecutar_operacion_binance(self, simbolo, tipo_operacion, precio_entrada, sl, tp):
         if not self.trader:
             print("❌ Trader no disponible. Operación omitida.")
-            return False
+            return False, None, None
         if not self.trader.set_leverage(simbolo, 5):
             print(f"❌ Falló al establecer apalancamiento 5x para {simbolo}")
-            return False
+            return False, None, None
         cantidad = self.calcular_tamaño_posicion(simbolo, precio_entrada)
         if not cantidad:
             print(f"❌ No se pudo calcular cantidad para {simbolo}")
-            return False
+            return False, None, None
         side = 'BUY' if tipo_operacion == 'LONG' else 'SELL'
         orden = self.trader.place_market_order(simbolo, side, cantidad)
         if not orden:
             print(f"❌ Falló al abrir posición {tipo_operacion} en {simbolo}")
-            return False
-        # 🔁 Validar y ajustar SL/TP para evitar error -2021
+            return False, None, None
         sl_side = 'SELL' if tipo_operacion == 'LONG' else 'BUY'
         tp_side = sl_side
         sl_ajustado, tp_ajustado = self.trader.validar_niveles_sl_tp(simbolo, sl_side, sl, tp)
-        # Colocar órdenes
-        sl_order = self.trader.place_stop_loss_order(simbolo, sl_side, sl_ajustado)
-        tp_order = self.trader.place_take_profit_order(simbolo, tp_side, tp_ajustado)
+        precision = self.trader.get_price_precision(simbolo)
+        sl_redondeado = round(sl_ajustado, precision)
+        tp_redondeado = round(tp_ajustado, precision)
+        sl_order = self.trader.place_stop_loss_order(simbolo, sl_side, sl_redondeado)
+        tp_order = self.trader.place_take_profit_order(simbolo, tp_side, tp_redondeado)
         if not sl_order or not tp_order:
             print(f"⚠️ Al menos una orden de cierre falló en {simbolo}. Verificando estado...")
             ordenes_activas = self.trader.client.futures_get_open_orders(symbol=simbolo)
@@ -653,14 +651,13 @@ class TradingBot:
                     type='MARKET',
                     reduceOnly=True
                 )
-                return False
-        return True
-    # === FUNCIÓN REEMPLAZADA: verificar_cierre_operaciones mejorada ===
+                return False, None, None
+        return True, tp_redondeado, sl_redondeado
+
     def verificar_cierre_operaciones(self):
         if not self.operaciones_activas:
             return []
         operaciones_cerradas = []
-        # Obtener posiciones reales en Binance
         try:
             posiciones = self.trader.client.futures_position_information()
             posiciones_dict = {p['symbol']: float(p['positionAmt']) for p in posiciones if float(p['positionAmt']) != 0}
@@ -670,7 +667,6 @@ class TradingBot:
         for simbolo, operacion in list(self.operaciones_activas.items()):
             posicion_actual = posiciones_dict.get(simbolo, 0.0)
             if posicion_actual == 0.0:
-                # La posición ya se cerró en Binance → procesar cierre
                 datos_mercado = self.obtener_datos_mercado_config(
                     simbolo, 
                     operacion.get('timeframe_utilizado', '5m'), 
@@ -722,7 +718,6 @@ class TradingBot:
                     except Exception:
                         pass
                 self.registrar_operacion(datos_operacion)
-                # ✅ Cancelar órdenes huérfanas
                 if self.trader:
                     self.trader.cancelar_ordenes_cierre(simbolo)
                 operaciones_cerradas.append(simbolo)
@@ -732,16 +727,15 @@ class TradingBot:
                 self.operaciones_desde_optimizacion += 1
                 print(f"     📊 {simbolo} Cierre detectado (posición cerrada en Binance) - PnL: {pnl_percent:.2f}%")
         return operaciones_cerradas
+
     def escanear_mercado(self):
         print(f"\n🔍 Escaneando {len(self.config.get('symbols', []))} símbolos (Estrategia: Breakout + Reentry)...")
         senales_encontradas = 0
         for simbolo in self.config.get('symbols', []):
             try:
-                # ✅ MODIFICACIÓN PRINCIPAL: NO PROCESAR SÍMBOLOS CON OPERACIÓN ACTIVA
                 if simbolo in self.operaciones_activas:
                     print(f"   ⚠️ {simbolo} - Operación ya activa. Saltando análisis.")
                     continue
-
                 config_optima = self.buscar_configuracion_optima_simbolo(simbolo)
                 if not config_optima:
                     continue
@@ -786,15 +780,39 @@ class TradingBot:
                     tiempo_desde_ultimo = (datetime.now() - ultimo_breakout).total_seconds() / 3600
                     if tiempo_desde_ultimo < 2:
                         continue
-                if self.ejecutar_operacion_binance(simbolo, tipo_operacion, precio_entrada, sl, tp):
+                resultado, tp_usado, sl_usado = self.ejecutar_operacion_binance(simbolo, tipo_operacion, precio_entrada, sl, tp)
+                if resultado:
+                    # ✅ REGISTRAR LA OPERACIÓN EN self.operaciones_activas ANTES de generar señal
+                    self.operaciones_activas[simbolo] = {
+                        'tipo': tipo_operacion,
+                        'precio_entrada': precio_entrada,
+                        'take_profit': tp_usado,
+                        'stop_loss': sl_usado,
+                        'timestamp_entrada': datetime.now().isoformat(),
+                        'angulo_tendencia': info_canal['angulo_tendencia'],
+                        'pearson': info_canal['coeficiente_pearson'],
+                        'r2_score': info_canal['r2_score'],
+                        'ancho_canal_relativo': info_canal['ancho_canal'] / precio_entrada,
+                        'ancho_canal_porcentual': info_canal['ancho_canal_porcentual'],
+                        'nivel_fuerza': info_canal['nivel_fuerza'],
+                        'timeframe_utilizado': config_optima['timeframe'],
+                        'velas_utilizadas': config_optima['num_velas'],
+                        'stoch_k': info_canal['stoch_k'],
+                        'stoch_d': info_canal['stoch_d'],
+                        'breakout_usado': True if simbolo in self.breakouts_detectados else False
+                    }
+                    self.senales_enviadas.add(simbolo)
+
                     self.generar_senal_operacion(
-                        simbolo, tipo_operacion, precio_entrada, tp, sl, 
+                        simbolo, tipo_operacion, precio_entrada, tp_usado, sl_usado, 
                         info_canal, datos_mercado, config_optima, self.esperando_reentry[simbolo]
                     )
                     senales_encontradas += 1
                     self.breakout_history[simbolo] = datetime.now()
                 else:
                     print(f"❌ Operación en {simbolo} no ejecutada en Binance")
+                    # NO eliminar esperando_reentry si falla → permitir reintentos
+                    continue
                 del self.esperando_reentry[simbolo]
             except Exception as e:
                 print(f"⚠️ Error analizando {simbolo}: {e}")
@@ -804,9 +822,10 @@ class TradingBot:
         else:
             print("❌ No se encontraron señales en este ciclo")
         return senales_encontradas
+
     def generar_senal_operacion(self, simbolo, tipo_operacion, precio_entrada, tp, sl,
                             info_canal, datos_mercado, config_optima, breakout_info=None):
-        if simbolo in self.senales_enviadas:
+        if simbolo in self.senales_enviadas and simbolo not in self.operaciones_activas:
             return
         riesgo = abs(precio_entrada - sl)
         beneficio = abs(tp - precio_entrada)
@@ -831,8 +850,8 @@ class TradingBot:
 📏 Ancho Canal: {info_canal['ancho_canal_porcentual']:.1f}% ⭐
 💰 <b>Precio Actual:</b> {datos_mercado['precio_actual']:.8f}
 🎯 <b>Entrada:</b> {precio_entrada:.8f}
-🛑 <b>Stop Loss:</b> {sl:.8f}
-🎯 <b>Take Profit:</b> {tp:.8f}
+🛑 <b>Stop Loss:</b> {sl:.{self.trader.get_price_precision(simbolo) if self.trader else 8}f}
+🎯 <b>Take Profit:</b> {tp:.{self.trader.get_price_precision(simbolo) if self.trader else 8}f}
 📊 <b>Ratio R/B:</b> {ratio_rr:.2f}:1
 🎯 <b>SL:</b> {sl_percent:.2f}%
 🎯 <b>TP:</b> {tp_percent:.2f}%
@@ -854,26 +873,10 @@ class TradingBot:
                 print(f"     ✅ Señal {tipo_operacion} para {simbolo} enviada")
             except Exception as e:
                 print(f"     ❌ Error enviando señal: {e}")
-        self.operaciones_activas[simbolo] = {
-            'tipo': tipo_operacion,
-            'precio_entrada': precio_entrada,
-            'take_profit': tp,
-            'stop_loss': sl,
-            'timestamp_entrada': datetime.now().isoformat(),
-            'angulo_tendencia': info_canal['angulo_tendencia'],
-            'pearson': info_canal['coeficiente_pearson'],
-            'r2_score': info_canal['r2_score'],
-            'ancho_canal_relativo': info_canal['ancho_canal'] / precio_entrada,
-            'ancho_canal_porcentual': info_canal['ancho_canal_porcentual'],
-            'nivel_fuerza': info_canal['nivel_fuerza'],
-            'timeframe_utilizado': config_optima['timeframe'],
-            'velas_utilizadas': config_optima['num_velas'],
-            'stoch_k': info_canal['stoch_k'],
-            'stoch_d': info_canal['stoch_d'],
-            'breakout_usado': breakout_info is not None
-        }
-        self.senales_enviadas.add(simbolo)
+
+        # ✅ El registro ya se hizo en escanear_mercado, así que solo actualizamos total
         self.total_operaciones += 1
+
     def inicializar_log(self):
         if not os.path.exists(self.archivo_log):
             with open(self.archivo_log, 'w', newline='', encoding='utf-8') as f:
@@ -1025,13 +1028,14 @@ class TradingBot:
         else:
             pnl_absoluto = datos_operacion['precio_entrada'] - datos_operacion['precio_salida']
         breakout_usado = "🚀 Sí" if datos_operacion.get('breakout_usado', False) else "❌ No"
+        precision = self.trader.get_price_precision(datos_operacion['symbol']) if self.trader else 8
         mensaje = f"""
 {emoji} <b>OPERACIÓN CERRADA - {datos_operacion['symbol']}</b>
 {color_emoji} <b>RESULTADO: {datos_operacion['resultado']}</b>
 📊 Tipo: {datos_operacion['tipo']}
-💰 Entrada: {datos_operacion['precio_entrada']:.8f}
-🎯 Salida: {datos_operacion['precio_salida']:.8f}
-💵 PnL Absoluto: {pnl_absoluto:.8f}
+💰 Entrada: {datos_operacion['precio_entrada']:.{precision}f}
+🎯 Salida: {datos_operacion['precio_salida']:.{precision}f}
+💵 PnL Absoluto: {pnl_absoluto:.{precision}f}
 📈 PnL %: {datos_operacion['pnl_percent']:.2f}%
 ⏰ Duración: {datos_operacion['duracion_minutos']:.1f} minutos
 🚀 Breakout+Reentry: {breakout_usado}
@@ -1232,9 +1236,7 @@ class TradingBot:
                 self.guardar_estado()
             except:
                 pass
-# ---------------------------
-# CONFIGURACIÓN SIMPLE
-# ---------------------------
+
 def crear_config_desde_entorno():
     directorio_actual = os.path.dirname(os.path.abspath(__file__))
     telegram_chat_ids_str = os.environ.get('TELEGRAM_CHAT_ID', '-1002272872445')
@@ -1265,12 +1267,11 @@ def crear_config_desde_entorno():
         'binance_secret_key': os.environ.get('BINANCE_SECRET_KEY'),
         'binance_testnet': os.environ.get('BINANCE_TESTNET', 'true').lower() == 'true'
     }
-# ---------------------------
-# FLASK APP Y RENDER
-# ---------------------------
+
 app = Flask(__name__)
 config = crear_config_desde_entorno()
 bot = TradingBot(config)
+
 def run_bot_loop():
     while True:
         try:
@@ -1279,11 +1280,14 @@ def run_bot_loop():
         except Exception as e:
             print(f"Error en el hilo del bot: {e}", file=sys.stderr)
             time.sleep(60)
+
 bot_thread = threading.Thread(target=run_bot_loop, daemon=True)
 bot_thread.start()
+
 @app.route('/')
 def index():
     return "Bot Breakout + Reentry está en línea.", 200
+
 @app.route('/webhook', methods=['POST'])
 def telegram_webhook():
     if request.is_json:
@@ -1291,6 +1295,7 @@ def telegram_webhook():
         print(f"Update recibido: {json.dumps(update)}", file=sys.stdout)
         return jsonify({"status": "ok"}), 200
     return jsonify({"error": "Request must be JSON"}), 400
+
 def setup_telegram_webhook():
     token = os.environ.get('TELEGRAM_TOKEN')
     if not token:
@@ -1307,6 +1312,7 @@ def setup_telegram_webhook():
         requests.get(f"https://api.telegram.org/bot{token}/setWebhook?url={webhook_url}")
     except Exception as e:
         print(f"Error configurando webhook: {e}", file=sys.stderr)
+
 if __name__ == '__main__':
     setup_telegram_webhook()
     app.run(debug=True, port=5000)
