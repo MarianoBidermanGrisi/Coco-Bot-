@@ -1,5 +1,6 @@
 # bot_web_service.py
 # ✅ VERSIÓN CORREGIDA: Errores -2021 y -1111 de Binance solucionados
+# ✅ NUEVAS MEJORAS: Modo AISLADO, Stop Loss persistente, Una operación por símbolo
 import requests
 import time
 import json
@@ -52,6 +53,23 @@ class BinanceTrader:
             return True
         except Exception as e:
             logger_binance.error(f"❌ Error al establecer apalancamiento: {e}")
+            return False
+
+    def set_margin_isolated(self, symbol):
+        """Configura el margen como AISLADO para el símbolo"""
+        try:
+            self.client.futures_change_margin_type(symbol=symbol, marginType='ISOLATED')
+            logger_binance.info(f"✅ Margen configurado como AISLADO para {symbol}")
+            return True
+        except BinanceAPIException as e:
+            if e.code == -4046:  # Margin type already set
+                logger_binance.info(f"ℹ️ Margen ya estaba como AISLADO para {symbol}")
+                return True
+            else:
+                logger_binance.error(f"❌ Error configurando margen AISLADO para {symbol}: {e}")
+                return False
+        except Exception as e:
+            logger_binance.error(f"❌ Error configurando margen AISLADO para {symbol}: {e}")
             return False
 
     def get_account_info(self):
@@ -280,6 +298,46 @@ class BinanceTrader:
                     logger_binance.info(f"🧹 Orden cancelada: {order['type']} ID {order['orderId']} en {symbol}")
         except Exception as e:
             logger_binance.error(f"❌ Error al cancelar órdenes de cierre en {symbol}: {e}")
+
+    # === NUEVAS FUNCIONES: Verificar y recolocar órdenes de cierre ===
+    def verificar_ordenes_cierre_activas(self, symbol):
+        """Verifica que las órdenes de SL y TP estén activas"""
+        try:
+            open_orders = self.client.futures_get_open_orders(symbol=symbol)
+            sl_active = any(order['type'] == 'STOP_MARKET' for order in open_orders)
+            tp_active = any(order['type'] == 'TAKE_PROFIT_MARKET' for order in open_orders)
+            
+            logger_binance.info(f"🔍 Verificando órdenes {symbol}: SL={sl_active}, TP={tp_active}")
+            return sl_active, tp_active
+            
+        except Exception as e:
+            logger_binance.error(f"❌ Error verificando órdenes activas en {symbol}: {e}")
+            return False, False
+
+    def recolocar_ordenes_cierre(self, symbol, side, sl_price, tp_price):
+        """Re-coloca órdenes de cierre si faltan"""
+        try:
+            sl_active, tp_active = self.verificar_ordenes_cierre_activas(symbol)
+            
+            if not sl_active:
+                logger_binance.warning(f"⚠️ Stop Loss no encontrado en {symbol}, recolocando...")
+                sl_order = self.place_stop_loss_order(symbol, side, sl_price)
+                if not sl_order:
+                    logger_binance.error(f"❌ Error crítico: No se pudo recolocar SL en {symbol}")
+                    return False
+            
+            if not tp_active:
+                logger_binance.warning(f"⚠️ Take Profit no encontrado en {symbol}, recolocando...")
+                tp_order = self.place_take_profit_order(symbol, side, tp_price)
+                if not tp_order:
+                    logger_binance.error(f"❌ Error crítico: No se pudo recolocar TP en {symbol}")
+                    return False
+            
+            return True
+            
+        except Exception as e:
+            logger_binance.error(f"❌ Error recolocando órdenes en {symbol}: {e}")
+            return False
 
 # --- FIN MÓDULO BINANCE TRADER ---
 
@@ -802,6 +860,27 @@ class TradingBot:
             logger_binance.error(f"❌ Error calculando tamaño posición para {symbol}: {e}")
             return None
 
+    # === NUEVA FUNCIÓN: Verificar operación activa en símbolo ===
+    def simbolo_tiene_operacion_activa(self, symbol):
+        """Verificación robusta de operaciones activas en el mismo símbolo"""
+        # 1. Verificar en operaciones activas del bot
+        if symbol in self.operaciones_activas:
+            print(f"   ⏭️  {symbol} ya tiene operación activa en el bot")
+            return True
+        
+        # 2. Verificar posiciones reales en Binance
+        if self.trader:
+            try:
+                positions = self.trader.client.futures_position_information()
+                for position in positions:
+                    if position['symbol'] == symbol and float(position['positionAmt']) != 0:
+                        print(f"   ⏭️  {symbol} tiene posición abierta en Binance")
+                        return True
+            except Exception as e:
+                print(f"⚠️ Error verificando posiciones Binance para {symbol}: {e}")
+        
+        return False
+
     # === FUNCIÓN MEJORADA: Ejecutar operación Binance ===
     def ejecutar_operacion_binance(self, simbolo, tipo_operacion, precio_entrada, sl, tp):
         if not self.trader:
@@ -812,6 +891,11 @@ class TradingBot:
             # Establecer apalancamiento
             if not self.trader.set_leverage(simbolo, 5):
                 print(f"❌ Falló al establecer apalancamiento 5x para {simbolo}")
+                return False
+            
+            # Configurar margen como AISLADO
+            if not self.trader.set_margin_isolated(simbolo):
+                print(f"❌ Falló al configurar margen AISLADO para {simbolo}")
                 return False
             
             # Calcular cantidad con las nuevas correcciones
@@ -890,6 +974,31 @@ class TradingBot:
         except Exception as e:
             logger_binance.error(f"❌ Error crítico ejecutando operación en {simbolo}: {e}")
             return False
+
+    # === NUEVA FUNCIÓN: Monitorear órdenes activas ===
+    def monitorear_ordenes_activas(self):
+        """Monitorea y mantiene las órdenes de cierre activas"""
+        if not self.trader or not self.operaciones_activas:
+            return
+        
+        for simbolo, operacion in list(self.operaciones_activas.items()):
+            try:
+                # Determinar side para órdenes de cierre
+                side_cierre = 'SELL' if operacion['tipo'] == 'LONG' else 'BUY'
+                
+                # Verificar y recolocar órdenes si es necesario
+                ordenes_ok = self.trader.recolocar_ordenes_cierre(
+                    simbolo, 
+                    side_cierre, 
+                    operacion['stop_loss'], 
+                    operacion['take_profit']
+                )
+                
+                if not ordenes_ok:
+                    logger_binance.error(f"🚨 CRÍTICO: No se pudieron mantener órdenes de cierre en {simbolo}")
+                    
+            except Exception as e:
+                print(f"⚠️ Error monitoreando órdenes para {simbolo}: {e}")
 
     # === FUNCIÓN MEJORADA: Verificar cierre operaciones ===
     def verificar_cierre_operaciones(self):
@@ -988,6 +1097,10 @@ class TradingBot:
         senales_encontradas = 0
         for simbolo in self.config.get('symbols', []):
             try:
+                # === VERIFICACIÓN ROBUSTA: No operar si ya hay posición activa ===
+                if self.simbolo_tiene_operacion_activa(simbolo):
+                    continue
+                    
                 if simbolo in self.operaciones_activas:
                     continue
                 config_optima = self.buscar_configuracion_optima_simbolo(simbolo)
@@ -1094,6 +1207,7 @@ class TradingBot:
 ⏰ <b>Hora:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 💡 <b>Estrategia:</b> BREAKOUT + REENTRY con confirmación Stochastic
 🤖 <b>Operación ejecutada en Binance Testnet con 5x apalancamiento</b>
+📌 <b>Modo Margen: AISLADO</b>
         """
         token = self.config.get('telegram_token')
         chat_ids = self.config.get('telegram_chat_ids', [])
@@ -1451,6 +1565,10 @@ class TradingBot:
         if random.random() < 0.1:
             self.reoptimizar_periodicamente()
             self.verificar_envio_reporte_automatico()    
+        
+        # === AGREGAR MONITOREO CONTINUO DE ÓRDENES ===
+        self.monitorear_ordenes_activas()
+        
         cierres = self.verificar_cierre_operaciones()
         if cierres:
             print(f"     📊 Operaciones cerradas: {', '.join(cierres)}")
@@ -1469,6 +1587,8 @@ class TradingBot:
         print("🎯 CORRECCIONES APLICADAS: Errores -2021 y -1111 SOLUCIONADOS")
         print("💾 PERSISTENCIA: ACTIVADA")
         print("🔄 REEVALUACIÓN: CADA 2 HORAS")
+        print("📌 MODO MARGEN: AISLADO")
+        print("🛡️  STOP LOSS PERSISTENTE: ACTIVADO")
         print("=" * 70)
         print(f"💱 Símbolos: {len(self.config.get('symbols', []))} monedas")
         print(f"📏 ANCHO MÍNIMO: {self.config.get('min_channel_width_percent', 4)}%")
