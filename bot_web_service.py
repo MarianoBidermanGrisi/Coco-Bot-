@@ -1,6 +1,6 @@
 # bot_web_service.py
 # ✅ VERSIÓN CORREGIDA: Errores -2021 y -1111 de Binance solucionados
-# ✅ NUEVAS MEJORAS: Modo AISLADO, Stop Loss persistente, Una operación por símbolo
+# ✅ MEJORAS CRÍTICAS: Operación solo exitosa si SL+TP se colocan, y sincronización estado-bot/exchange
 import requests
 import time
 import json
@@ -131,7 +131,6 @@ class BinanceTrader:
                     if f['filterType'] == 'LOT_SIZE':
                         step_size = float(f['stepSize'])
                         min_qty = float(f['minQty'])
-                        
                         # Asegurar que cumple con step size
                         if step_size < 1.0:
                             precision = int(round(-math.log10(step_size), 0))
@@ -139,13 +138,11 @@ class BinanceTrader:
                             quantity = round(quantity, precision)
                         else:
                             quantity = math.floor(quantity)
-                        
                         # Verificar mínimo
                         if quantity < min_qty:
                             logger_binance.error(f"❌ Cantidad {quantity} menor que mínimo {min_qty}")
                             return None
                         break
-            
             logger_binance.info(f"📈 Enviando orden MARKET: {side} {quantity} {symbol}")
             order = self.client.futures_create_order(
                 symbol=symbol,
@@ -155,7 +152,6 @@ class BinanceTrader:
             )
             logger_binance.info(f"✅ Orden enviada. ID: {order['orderId']}")
             return order
-            
         except BinanceAPIException as e:
             if e.code == -1111:  # Precision error
                 logger_binance.error(f"❌ Error de precisión en {symbol}: {e.message}")
@@ -212,7 +208,6 @@ class BinanceTrader:
         try:
             ticker = self.client.futures_symbol_ticker(symbol=symbol)
             precio_actual = float(ticker['price'])
-            
             # Obtener información del símbolo para conocer el tickSize
             symbol_info = self.get_symbol_info(symbol)
             tick_size = 0.0001  # valor por defecto
@@ -221,10 +216,8 @@ class BinanceTrader:
                     if f['filterType'] == 'PRICE_FILTER':
                         tick_size = float(f['tickSize'])
                         break
-            
             # Calcular distancia mínima basada en el tickSize (más conservadora)
             min_distance = tick_size * 10  # 10 ticks de separación mínima
-            
             if side == 'BUY':  # Posición SHORT → SL arriba, TP abajo
                 if sl_price <= precio_actual + min_distance:
                     sl_price = precio_actual * 1.008  # 0.8% arriba en lugar de 0.5%
@@ -235,7 +228,6 @@ class BinanceTrader:
                     sl_price = precio_actual * 0.992  # 0.8% abajo
                 if tp_price <= precio_actual + min_distance:
                     tp_price = precio_actual * 1.008  # 0.8% arriba
-            
             # Asegurar que SL y TP no estén demasiado cerca entre sí
             distance_sl_tp = abs(sl_price - tp_price)
             if distance_sl_tp < (min_distance * 5):
@@ -243,10 +235,8 @@ class BinanceTrader:
                     tp_price = sl_price - (min_distance * 10)
                 else:
                     tp_price = sl_price + (min_distance * 10)
-                    
             logger_binance.info(f"✅ Niveles validados: SL={sl_price:.8f}, TP={tp_price:.8f}, Precio={precio_actual:.8f}")
             return sl_price, tp_price
-            
         except Exception as e:
             logger_binance.error(f"❌ Error validando SL/TP para {symbol}: {e}")
             return sl_price, tp_price
@@ -257,13 +247,11 @@ class BinanceTrader:
         try:
             symbol_info = self.get_symbol_info(symbol)
             min_price_distance = 0.0001
-            
             if symbol_info:
                 for f in symbol_info['filters']:
                     if f['filterType'] == 'PRICE_FILTER':
                         min_price_distance = float(f['tickSize']) * 15  # 15 ticks mínimo
                         break
-            
             # Verificar distancia del SL
             distancia_sl = abs(precio_actual - sl_price)
             if distancia_sl < min_price_distance:
@@ -272,7 +260,6 @@ class BinanceTrader:
                 else:  # LONG
                     sl_price = precio_actual * 0.99  # 1% abajo
                 logger_binance.warning(f"⚠️ SL ajustado por distancia insuficiente: {sl_price:.8f}")
-            
             # Verificar distancia del TP
             distancia_tp = abs(precio_actual - tp_price)
             if distancia_tp < min_price_distance:
@@ -281,9 +268,7 @@ class BinanceTrader:
                 else:  # LONG
                     tp_price = precio_actual * 1.01  # 1% arriba
                 logger_binance.warning(f"⚠️ TP ajustado por distancia insuficiente: {tp_price:.8f}")
-            
             return sl_price, tp_price
-            
         except Exception as e:
             logger_binance.error(f"❌ Error verificando distancia órdenes: {e}")
             return sl_price, tp_price
@@ -306,10 +291,8 @@ class BinanceTrader:
             open_orders = self.client.futures_get_open_orders(symbol=symbol)
             sl_active = any(order['type'] == 'STOP_MARKET' for order in open_orders)
             tp_active = any(order['type'] == 'TAKE_PROFIT_MARKET' for order in open_orders)
-            
             logger_binance.info(f"🔍 Verificando órdenes {symbol}: SL={sl_active}, TP={tp_active}")
             return sl_active, tp_active
-            
         except Exception as e:
             logger_binance.error(f"❌ Error verificando órdenes activas en {symbol}: {e}")
             return False, False
@@ -318,31 +301,28 @@ class BinanceTrader:
         """Re-coloca órdenes de cierre si faltan"""
         try:
             sl_active, tp_active = self.verificar_ordenes_cierre_activas(symbol)
-            
             if not sl_active:
                 logger_binance.warning(f"⚠️ Stop Loss no encontrado en {symbol}, recolocando...")
                 sl_order = self.place_stop_loss_order(symbol, side, sl_price)
                 if not sl_order:
                     logger_binance.error(f"❌ Error crítico: No se pudo recolocar SL en {symbol}")
                     return False
-            
             if not tp_active:
                 logger_binance.warning(f"⚠️ Take Profit no encontrado en {symbol}, recolocando...")
                 tp_order = self.place_take_profit_order(symbol, side, tp_price)
                 if not tp_order:
                     logger_binance.error(f"❌ Error crítico: No se pudo recolocar TP en {symbol}")
                     return False
-            
             return True
-            
         except Exception as e:
             logger_binance.error(f"❌ Error recolocando órdenes en {symbol}: {e}")
             return False
 
-# --- FIN MÓDULO BINANCE TRADER ---
 
+# --- FIN MÓDULO BINANCE TRADER ---
 logging.basicConfig(level=logging.INFO, stream=sys.stdout, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
 
 # ---------------------------
 # Optimizador IA
@@ -438,6 +418,7 @@ class OptimizadorIA:
         else:
             print("⚠ No se encontró una configuración mejor")
         return mejores_param
+
 
 # ---------------------------
 # BOT PRINCIPAL - BREAKOUT + REENTRY (MEJORADO)
@@ -795,39 +776,31 @@ class TradingBot:
     def calcular_tamaño_posicion(self, symbol, precio_entrada):
         if not self.trader:
             return None
-        
         try:
             info_cuenta = self.trader.get_account_info()
             if not info_cuenta:
                 return None
-            
             balance = float(info_cuenta['availableBalance'])
             monto_usdt = balance * 0.03  # 3% del balance
-            
             # Obtener información del símbolo para LOT_SIZE
             symbol_info = self.trader.get_symbol_info(symbol)
             if not symbol_info:
                 return None
-            
             # Encontrar los filtros de cantidad
             step_size = None
             min_qty = None
             max_qty = None
-            
             for f in symbol_info['filters']:
                 if f['filterType'] == 'LOT_SIZE':
                     step_size = float(f['stepSize'])
                     min_qty = float(f['minQty'])
                     max_qty = float(f['maxQty']) if 'maxQty' in f else None
                     break
-            
             if step_size is None:
                 logger_binance.error(f"❌ No se pudo obtener LOT_SIZE para {symbol}")
                 return None
-            
             # Calcular cantidad base
             cantidad_base = monto_usdt / precio_entrada
-            
             # Aplicar step size correctamente
             if step_size < 1.0:
                 # Para step sizes fraccionales (ej: 0.001)
@@ -837,142 +810,160 @@ class TradingBot:
             else:
                 # Para step sizes enteros (ej: 1.0)
                 cantidad_ajustada = math.floor(cantidad_base)
-            
             # Verificar cantidad mínima
             if min_qty and cantidad_ajustada < min_qty:
                 logger_binance.warning(f"⚠️ Cantidad {cantidad_ajustada} menor que minQty {min_qty} para {symbol}")
                 cantidad_ajustada = min_qty
-            
             # Verificar cantidad máxima
             if max_qty and cantidad_ajustada > max_qty:
                 logger_binance.warning(f"⚠️ Cantidad {cantidad_ajustada} mayor que maxQty {max_qty} para {symbol}")
                 cantidad_ajustada = max_qty
-            
             # Verificación final
             if cantidad_ajustada <= 0:
                 logger_binance.error(f"❌ Cantidad ajustada es 0 o negativa para {symbol}")
                 return None
-            
             logger_binance.info(f"✅ Tamaño posición calculado: {cantidad_ajustada} {symbol}")
             return cantidad_ajustada
-            
         except Exception as e:
             logger_binance.error(f"❌ Error calculando tamaño posición para {symbol}: {e}")
             return None
 
-    # === NUEVA FUNCIÓN: Verificar operación activa en símbolo ===
+    # ✅ NUEVA FUNCIÓN MEJORADA: Sincronización de estado
     def simbolo_tiene_operacion_activa(self, symbol):
-        """Verificación robusta de operaciones activas en el mismo símbolo"""
-        # 1. Verificar en operaciones activas del bot
-        if symbol in self.operaciones_activas:
-            print(f"   ⏭️  {symbol} ya tiene operación activa en el bot")
-            return True
-        
-        # 2. Verificar posiciones reales en Binance
+        """Verificación robusta + sincronización con Binance"""
+        posicion_en_broker = False
+        posicion_en_bot = symbol in self.operaciones_activas
+
+        # --- 1. Verificar en Binance ---
         if self.trader:
             try:
                 positions = self.trader.client.futures_position_information()
                 for position in positions:
                     if position['symbol'] == symbol and float(position['positionAmt']) != 0:
-                        print(f"   ⏭️  {symbol} tiene posición abierta en Binance")
-                        return True
+                        posicion_en_broker = True
+                        break
             except Exception as e:
-                print(f"⚠️ Error verificando posiciones Binance para {symbol}: {e}")
-        
-        return False
+                print(f"⚠️ Error al verificar posiciones reales en Binance para {symbol}: {e}")
+                return True  # Asumir que hay operación si no se puede verificar
 
-    # === FUNCIÓN MEJORADA: Ejecutar operación Binance ===
+        # --- 2. Sincronización: inconsistencias ---
+        if posicion_en_bot and not posicion_en_broker:
+            # El bot cree que hay operación, pero ya no existe en Binance → limpiar
+            print(f"🧹 {symbol}: Inconsistencia detectada → posición cerrada en exchange pero activa en bot. Limpiando estado.")
+            if symbol in self.operaciones_activas:
+                del self.operaciones_activas[symbol]
+            if symbol in self.senales_enviadas:
+                self.senales_enviadas.remove(symbol)
+            return False
+
+        elif not posicion_en_bot and posicion_en_broker:
+            # Hay posición en Binance, pero el bot no la sabe → registrar como activa (protección defensiva)
+            print(f"⚠️ {symbol}: Posición activa en Binance pero no registrada en el bot. Bloqueando nuevas operaciones.")
+            return True
+
+        # --- 3. Estado coherente ---
+        return posicion_en_bot or posicion_en_broker
+
+    # ✅ FUNCIÓN MEJORADA: Solo éxito si SL+TP confirmados
     def ejecutar_operacion_binance(self, simbolo, tipo_operacion, precio_entrada, sl, tp):
         if not self.trader:
             print("❌ Trader no disponible. Operación omitida.")
             return False
-        
+
+        orden_principal = None
+        posicion_abierta = False
+        sl_order = None
+        tp_order = None
+
         try:
-            # Establecer apalancamiento
+            # --- 1. Establecer apalancamiento y margen ---
             if not self.trader.set_leverage(simbolo, 5):
                 print(f"❌ Falló al establecer apalancamiento 5x para {simbolo}")
                 return False
-            
-            # Configurar margen como AISLADO
+
             if not self.trader.set_margin_isolated(simbolo):
                 print(f"❌ Falló al configurar margen AISLADO para {simbolo}")
                 return False
-            
-            # Calcular cantidad con las nuevas correcciones
+
+            # --- 2. Calcular cantidad válida ---
             cantidad = self.calcular_tamaño_posicion(simbolo, precio_entrada)
             if not cantidad:
                 print(f"❌ No se pudo calcular cantidad válida para {simbolo}")
                 return False
-            
+
             side = 'BUY' if tipo_operacion == 'LONG' else 'SELL'
-            
-            # Obtener precio actual para validaciones
+            sl_side = 'SELL' if tipo_operacion == 'LONG' else 'BUY'
+
+            # --- 3. Obtener precio actual y ajustar SL/TP ---
             ticker = self.trader.client.futures_symbol_ticker(symbol=simbolo)
             precio_actual = float(ticker['price'])
-            
-            # Validar y ajustar SL/TP
-            sl_side = 'SELL' if tipo_operacion == 'LONG' else 'BUY'
+
             sl_ajustado, tp_ajustado = self.trader.validar_niveles_sl_tp(simbolo, sl_side, sl, tp)
-            
-            # Verificar distancias adicionales
             sl_ajustado, tp_ajustado = self.trader.verificar_distancia_ordenes(
                 simbolo, precio_actual, sl_ajustado, tp_ajustado, sl_side
             )
-            
-            # Colocar orden principal
-            orden = self.trader.place_market_order(simbolo, side, cantidad)
-            if not orden:
+
+            # --- 4. Abrir posición ---
+            orden_principal = self.trader.place_market_order(simbolo, side, cantidad)
+            if not orden_principal:
                 print(f"❌ Falló al abrir posición {tipo_operacion} en {simbolo}")
                 return False
 
-            # Pequeña pausa para asegurar que la posición esté abierta
-            time.sleep(1)
-            
-            # Colocar órdenes de cierre con reintentos
+            posicion_abierta = True
+            time.sleep(1.5)  # Asegurar sincronización con exchange
+
+            # --- 5. Intentar colocar SL y TP con reintentos ---
             max_retries = 3
-            sl_order = None
-            tp_order = None
-            
             for attempt in range(max_retries):
-                try:
-                    if not sl_order:
-                        sl_order = self.trader.place_stop_loss_order(simbolo, sl_side, sl_ajustado)
-                    if not tp_order:
-                        tp_order = self.trader.place_take_profit_order(simbolo, sl_side, tp_ajustado)
-                    
-                    if sl_order and tp_order:
-                        break
-                        
-                    time.sleep(2)  # Esperar antes de reintentar
-                    
-                except BinanceAPIException as e:
-                    if e.code == -2021 and attempt < max_retries - 1:
-                        logger_binance.warning(f"🔄 Reintentando órdenes de cierre (intento {attempt + 1})")
-                        # Recalcular SL/TP con mayor distancia
-                        sl_ajustado = sl_ajustado * 1.005 if tipo_operacion == 'LONG' else sl_ajustado * 0.995
-                        tp_ajustado = tp_ajustado * 0.995 if tipo_operacion == 'LONG' else tp_ajustado * 1.005
-                        continue
+                sl_order = self.trader.place_stop_loss_order(simbolo, sl_side, sl_ajustado)
+                tp_order = self.trader.place_take_profit_order(simbolo, sl_side, tp_ajustado)
+
+                if sl_order and tp_order:
+                    print(f"✅ Operación {tipo_operacion} en {simbolo} completamente protegida (SL + TP)")
+                    return True  # ✅ ÚNICO PUNTO DE ÉXITO
+
+                # Si falla, ajustar niveles y reintentar
+                if attempt < max_retries - 1:
+                    logger_binance.warning(f"🔄 Reintentando órdenes de cierre ({attempt + 1}/{max_retries}) en {simbolo}")
+                    # Aumentar margen de seguridad
+                    if tipo_operacion == 'LONG':
+                        sl_ajustado *= 0.995
+                        tp_ajustado *= 1.005
                     else:
-                        raise e
+                        sl_ajustado *= 1.005
+                        tp_ajustado *= 0.995
+                    time.sleep(2)
+                else:
+                    logger_binance.error(f"❌ No se pudieron colocar ambas órdenes de cierre en {simbolo} tras {max_retries} intentos")
 
-            # Verificar estado final de las órdenes
-            if not sl_order or not tp_order:
-                logger_binance.warning(f"⚠️ Al menos una orden de cierre falló en {simbolo}. Verificando estado...")
-                
-                # Verificar órdenes existentes
-                ordenes_activas = self.trader.client.futures_get_open_orders(symbol=simbolo)
-                sl_existe = any(o['type'] == 'STOP_MARKET' for o in ordenes_activas)
-                tp_existe = any(o['type'] == 'TAKE_PROFIT_MARKET' for o in ordenes_activas)
-                
-                if not sl_existe or not tp_existe:
-                    logger_binance.error(f"❌ Operación en {simbolo} NO protegida adecuadamente")
-                    # No cerramos inmediatamente, esperamos a la siguiente verificación
-                    return True  # Devolvemos True igual para que el bot registre la operación
+            # --- 6. FALLA: Cancelar posición si no está protegida ---
+            print(f"⚠️ Cancelando posición en {simbolo} por falta de protección (SL/TP)")
+            self.trader.client.futures_create_order(
+                symbol=simbolo,
+                side='SELL' if side == 'BUY' else 'BUY',
+                type='MARKET',
+                quantity=cantidad
+            )
+            logger_binance.info(f"CloseOperation: Posición cerrada por falta de SL/TP en {simbolo}")
 
-            return True
-            
+            return False
+
         except Exception as e:
-            logger_binance.error(f"❌ Error crítico ejecutando operación en {simbolo}: {e}")
+            logger_binance.error(f"❌ Error crítico en ejecutar_operacion_binance({simbolo}): {e}")
+
+            # --- Manejo de fallo: cerrar posición si se abrió ---
+            if posicion_abierta:
+                try:
+                    logger_binance.warning(f"CloseOperation tras error: cerrando posición en {simbolo}")
+                    self.trader.client.futures_create_order(
+                        symbol=simbolo,
+                        side='SELL' if tipo_operacion == 'LONG' else 'BUY',
+                        type='MARKET',
+                        quantity=cantidad
+                    )
+                except Exception as close_err:
+                    logger_binance.error(f"❌ Error al cerrar posición tras fallo: {close_err}")
+
             return False
 
     # === NUEVA FUNCIÓN: Monitorear órdenes activas ===
@@ -980,12 +971,10 @@ class TradingBot:
         """Monitorea y mantiene las órdenes de cierre activas"""
         if not self.trader or not self.operaciones_activas:
             return
-        
         for simbolo, operacion in list(self.operaciones_activas.items()):
             try:
                 # Determinar side para órdenes de cierre
                 side_cierre = 'SELL' if operacion['tipo'] == 'LONG' else 'BUY'
-                
                 # Verificar y recolocar órdenes si es necesario
                 ordenes_ok = self.trader.recolocar_ordenes_cierre(
                     simbolo, 
@@ -993,10 +982,8 @@ class TradingBot:
                     operacion['stop_loss'], 
                     operacion['take_profit']
                 )
-                
                 if not ordenes_ok:
                     logger_binance.error(f"🚨 CRÍTICO: No se pudieron mantener órdenes de cierre en {simbolo}")
-                    
             except Exception as e:
                 print(f"⚠️ Error monitoreando órdenes para {simbolo}: {e}")
 
@@ -1004,9 +991,7 @@ class TradingBot:
     def verificar_cierre_operaciones(self):
         if not self.operaciones_activas:
             return []
-        
         operaciones_cerradas = []
-        
         # Obtener posiciones reales en Binance
         try:
             posiciones = self.trader.client.futures_position_information()
@@ -1014,10 +999,8 @@ class TradingBot:
         except Exception as e:
             print(f"⚠️ Error obteniendo posiciones reales: {e}")
             posiciones_dict = {}
-
         for simbolo, operacion in list(self.operaciones_activas.items()):
             posicion_actual = posiciones_dict.get(simbolo, 0.0)
-            
             if posicion_actual == 0.0:
                 # La posición ya se cerró en Binance → procesar cierre
                 datos_mercado = self.obtener_datos_mercado_config(
@@ -1028,21 +1011,17 @@ class TradingBot:
                 if not datos_mercado:
                     continue
                 precio_salida = datos_mercado['precio_actual']
-
                 if operacion['tipo'] == "LONG":
                     pnl_percent = ((precio_salida - operacion['precio_entrada']) / operacion['precio_entrada']) * 100
                 else:
                     pnl_percent = ((operacion['precio_entrada'] - precio_salida) / operacion['precio_entrada']) * 100
-
                 tp = operacion['take_profit']
                 sl = operacion['stop_loss']
                 resultado = "TP" if (
                     (operacion['tipo'] == "LONG" and precio_salida >= tp * 0.995) or
                     (operacion['tipo'] == "SHORT" and precio_salida <= tp * 1.005)
                 ) else "SL"
-
                 duracion_minutos = (datetime.now() - datetime.fromisoformat(operacion['timestamp_entrada'])).total_seconds() / 60
-
                 datos_operacion = {
                     'timestamp': datetime.now().isoformat(),
                     'symbol': simbolo,
@@ -1066,7 +1045,6 @@ class TradingBot:
                     'stoch_d': operacion.get('stoch_d', 0),
                     'breakout_usado': operacion.get('breakout_usado', False)
                 }
-
                 mensaje_cierre = self.generar_mensaje_cierre(datos_operacion)
                 token = self.config.get('telegram_token')
                 chats = self.config.get('telegram_chat_ids', [])
@@ -1075,21 +1053,16 @@ class TradingBot:
                         self._enviar_telegram_simple(mensaje_cierre, token, chats)
                     except Exception:
                         pass
-
                 self.registrar_operacion(datos_operacion)
-
                 # ✅ Cancelar órdenes huérfanas
                 if self.trader:
                     self.trader.cancelar_ordenes_cierre(simbolo)
-
                 operaciones_cerradas.append(simbolo)
                 del self.operaciones_activas[simbolo]
                 if simbolo in self.senales_enviadas:
                     self.senales_enviadas.remove(simbolo)
                 self.operaciones_desde_optimizacion += 1
-
                 print(f"     📊 {simbolo} Cierre detectado (posición cerrada en Binance) - PnL: {pnl_percent:.2f}%")
-
         return operaciones_cerradas
 
     def escanear_mercado(self):
@@ -1100,7 +1073,6 @@ class TradingBot:
                 # === VERIFICACIÓN ROBUSTA: No operar si ya hay posición activa ===
                 if self.simbolo_tiene_operacion_activa(simbolo):
                     continue
-                    
                 if simbolo in self.operaciones_activas:
                     continue
                 config_optima = self.buscar_configuracion_optima_simbolo(simbolo)
@@ -1167,7 +1139,7 @@ class TradingBot:
         return senales_encontradas
 
     def generar_senal_operacion(self, simbolo, tipo_operacion, precio_entrada, tp, sl,
-                            info_canal, datos_mercado, config_optima, breakout_info=None):
+                                info_canal, datos_mercado, config_optima, breakout_info=None):
         if simbolo in self.senales_enviadas:
             return
         riesgo = abs(precio_entrada - sl)
@@ -1565,10 +1537,8 @@ class TradingBot:
         if random.random() < 0.1:
             self.reoptimizar_periodicamente()
             self.verificar_envio_reporte_automatico()    
-        
         # === AGREGAR MONITOREO CONTINUO DE ÓRDENES ===
         self.monitorear_ordenes_activas()
-        
         cierres = self.verificar_cierre_operaciones()
         if cierres:
             print(f"     📊 Operaciones cerradas: {', '.join(cierres)}")
@@ -1621,6 +1591,7 @@ class TradingBot:
             except:
                 pass
 
+
 # ---------------------------
 # CONFIGURACIÓN SIMPLE
 # ---------------------------
@@ -1654,6 +1625,7 @@ def crear_config_desde_entorno():
         'binance_secret_key': os.environ.get('BINANCE_SECRET_KEY'),
         'binance_testnet': os.environ.get('BINANCE_TESTNET', 'true').lower() == 'true'
     }
+
 
 # ---------------------------
 # FLASK APP Y RENDER
