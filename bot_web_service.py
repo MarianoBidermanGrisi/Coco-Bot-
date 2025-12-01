@@ -1,6 +1,7 @@
 # bot_web_service.py
 # ✅ VERSIÓN CORREGIDA: Errores -2021, -1111 y -4164 de Binance solucionados
 # ✅ MEJORAS CRÍTICAS: Operación solo exitosa si SL+TP se colocan, y sincronización estado-bot/exchange
+# ✅ FIX CRÍTICO: Error -1003 (Way too many requests) resuelto → caché de posiciones por ciclo
 import requests
 import time
 import json
@@ -434,6 +435,7 @@ class TradingBot:
         self.senales_enviadas = set()
         self.archivo_log = self.log_path
         self.inicializar_log()
+
     def cargar_estado(self):
         try:
             if os.path.exists(self.estado_file):
@@ -466,6 +468,7 @@ class TradingBot:
                 print("✅ Estado anterior cargado correctamente")
         except Exception as e:
             print(f"⚠ Error cargando estado previo: {e}")
+
     def guardar_estado(self):
         try:
             estado = {
@@ -499,6 +502,7 @@ class TradingBot:
             print("💾 Estado guardado correctamente")
         except Exception as e:
             print(f"⚠ Error guardando estado: {e}")
+
     def buscar_configuracion_optima_simbolo(self, simbolo):
         if simbolo in self.config_optima_por_simbolo:
             ultima_busqueda = self.ultima_busqueda_config.get(simbolo)
@@ -540,6 +544,7 @@ class TradingBot:
             self.ultima_busqueda_config[simbolo] = datetime.now()
             print(f"   ✅ Config óptima: {mejor_config['timeframe']} - {mejor_config['num_velas']} velas - Ancho: {mejor_config['ancho_canal']:.1f}%")
         return mejor_config
+
     def obtener_datos_mercado_config(self, simbolo, timeframe, num_velas):
         url = "https://api.binance.com/api/v3/klines"
         params = {'symbol': simbolo, 'interval': timeframe, 'limit': num_velas + 14}
@@ -563,6 +568,7 @@ class TradingBot:
             }
         except Exception:
             return None
+
     def calcular_canal_regresion_config(self, datos_mercado, candle_period):
         if not datos_mercado or len(datos_mercado['maximos']) < candle_period:
             return None
@@ -620,6 +626,7 @@ class TradingBot:
             'timeframe': datos_mercado.get('timeframe', 'N/A'),
             'num_velas': candle_period
         }
+
     def enviar_alerta_breakout(self, simbolo, tipo_breakout, info_canal, datos_mercado, config_optima):
         precio_cierre = datos_mercado['cierres'][-1]
         resistencia = info_canal['resistencia']
@@ -649,6 +656,7 @@ class TradingBot:
                 print(f"     ✅ Alerta de breakout enviada para {simbolo}")
             except Exception as e:
                 print(f"     ❌ Error enviando alerta de breakout: {e}")
+
     def detectar_breakout(self, simbolo, info_canal, datos_mercado):
         if not info_canal:
             return None
@@ -678,6 +686,7 @@ class TradingBot:
             if precio_cierre > resistencia:
                 return "BREAKOUT_SHORT"
         return None
+
     def detectar_reentry(self, simbolo, info_canal, datos_mercado):
         if simbolo not in self.esperando_reentry:
             return None
@@ -711,6 +720,7 @@ class TradingBot:
                         del self.breakouts_detectados[simbolo]
                     return "SHORT"
         return None
+
     def calcular_niveles_entrada(self, tipo_operacion, info_canal, precio_actual):
         if not info_canal:
             return None, None, None
@@ -735,6 +745,7 @@ class TradingBot:
             else:
                 take_profit = precio_entrada - (riesgo * self.config['min_rr_ratio'])
         return precio_entrada, take_profit, stop_loss
+
     # === FUNCIÓN MEJORADA: Calcular tamaño posición ===
     def calcular_tamaño_posicion(self, symbol, precio_entrada):
         if not self.trader:
@@ -747,8 +758,6 @@ class TradingBot:
             # Usar 3% del balance, pero asegurarse de que el notional sea >= 5 USDT
             monto_usdt_deseado = balance * 0.03
             notional_minimo = 5.0  # Requisito de Binance Futures
-
-            # Si el 3% es menor que 5 USDT, usar exactamente 5 USDT (si hay saldo suficiente)
             if monto_usdt_deseado < notional_minimo:
                 if balance < notional_minimo:
                     logger_binance.warning(f"⚠️ Saldo insuficiente ({balance:.2f} USDT) para abrir posición en {symbol} (mínimo: {notional_minimo} USDT)")
@@ -756,12 +765,9 @@ class TradingBot:
                 monto_usdt = notional_minimo
             else:
                 monto_usdt = monto_usdt_deseado
-
-            # Obtener información del símbolo para LOT_SIZE
             symbol_info = self.trader.get_symbol_info(symbol)
             if not symbol_info:
                 return None
-
             step_size = None
             min_qty = None
             max_qty = None
@@ -771,34 +777,22 @@ class TradingBot:
                     min_qty = float(f['minQty'])
                     max_qty = float(f['maxQty']) if 'maxQty' in f else None
                     break
-
             if step_size is None:
                 logger_binance.error(f"❌ No se pudo obtener LOT_SIZE para {symbol}")
                 return None
-
-            # Calcular cantidad base
             cantidad_base = monto_usdt / precio_entrada
-
-            # Aplicar step size
             if step_size < 1.0:
                 precision = int(round(-math.log10(step_size), 0))
                 cantidad_ajustada = math.floor(cantidad_base / step_size) * step_size
                 cantidad_ajustada = round(cantidad_ajustada, precision)
             else:
                 cantidad_ajustada = math.floor(cantidad_base)
-
-            # Verificar cantidad mínima
             if min_qty and cantidad_ajustada < min_qty:
                 cantidad_ajustada = min_qty
-
-            # Verificar cantidad máxima
             if max_qty and cantidad_ajustada > max_qty:
                 cantidad_ajustada = max_qty
-
-            # Verificación final del notional (por si el redondeo lo bajó)
             notional_final = cantidad_ajustada * precio_entrada
             if notional_final < notional_minimo:
-                # Intentar ajustar hacia arriba para cumplir con el mínimo
                 cantidad_minima_necesaria = notional_minimo / precio_entrada
                 if step_size < 1.0:
                     precision = int(round(-math.log10(step_size), 0))
@@ -806,47 +800,33 @@ class TradingBot:
                     cantidad_minima_ajustada = round(cantidad_minima_ajustada, precision)
                 else:
                     cantidad_minima_ajustada = math.ceil(cantidad_minima_necesaria)
-
-                # Verificar que no exceda el saldo disponible
                 if cantidad_minima_ajustada * precio_entrada > balance:
                     logger_binance.warning(f"⚠️ Saldo insuficiente para cumplir notional mínimo en {symbol}")
                     return None
-
-                # Verificar contra max_qty
                 if max_qty and cantidad_minima_ajustada > max_qty:
                     logger_binance.warning(f"⚠️ Cantidad mínima requerida excede maxQty en {symbol}")
                     return None
-
                 cantidad_ajustada = cantidad_minima_ajustada
-
             if cantidad_ajustada <= 0:
                 logger_binance.error(f"❌ Cantidad ajustada es 0 o negativa para {symbol}")
                 return None
-
             logger_binance.info(f"✅ Tamaño posición calculado: {cantidad_ajustada} {symbol} (Notional: {cantidad_ajustada * precio_entrada:.2f} USDT)")
             return cantidad_ajustada
         except Exception as e:
             logger_binance.error(f"❌ Error calculando tamaño posición para {symbol}: {e}")
             return None
-    # ✅ NUEVA FUNCIÓN: Sincronización robusta
+
+    # ✅ NUEVA FUNCIÓN: Sincronización robusta (USANDO CACHE)
     def simbolo_tiene_operacion_activa(self, symbol):
-        """Verificación robusta + sincronización con Binance"""
-        posicion_en_broker = False
+        """Verificación robusta + sincronización con Binance, usando cache"""
         posicion_en_bot = symbol in self.operaciones_activas
-        # --- 1. Verificar en Binance ---
-        if self.trader:
-            try:
-                positions = self.trader.client.futures_position_information()
-                for position in positions:
-                    if position['symbol'] == symbol and float(position['positionAmt']) != 0:
-                        posicion_en_broker = True
-                        break
-            except Exception as e:
-                print(f"⚠️ Error al verificar posiciones reales en Binance para {symbol}: {e}")
-                return True  # Asumir que hay operación si no se puede verificar
+
+        # Usar cache de posiciones del ciclo actual
+        posiciones_cache = getattr(self, 'posiciones_cache', {})
+        posicion_en_broker = float(posiciones_cache.get(symbol, 0)) != 0.0
+
         # --- 2. Sincronización: inconsistencias ---
         if posicion_en_bot and not posicion_en_broker:
-            # El bot cree que hay operación, pero ya no existe en Binance → limpiar
             print(f"🧹 {symbol}: Inconsistencia detectada → posición cerrada en exchange pero activa en bot. Limpiando estado.")
             if symbol in self.operaciones_activas:
                 del self.operaciones_activas[symbol]
@@ -854,11 +834,11 @@ class TradingBot:
                 self.senales_enviadas.remove(symbol)
             return False
         elif not posicion_en_bot and posicion_en_broker:
-            # Hay posición en Binance, pero el bot no la sabe → registrar como activa (protección defensiva)
             print(f"⚠️ {symbol}: Posición activa en Binance pero no registrada en el bot. Bloqueando nuevas operaciones.")
             return True
-        # --- 3. Estado coherente ---
+
         return posicion_en_bot or posicion_en_broker
+
     # ✅ FUNCIÓN MEJORADA: Solo éxito si SL+TP confirmados
     def ejecutar_operacion_binance(self, simbolo, tipo_operacion, precio_entrada, sl, tp):
         if not self.trader:
@@ -869,46 +849,39 @@ class TradingBot:
         sl_order = None
         tp_order = None
         try:
-            # --- 1. Establecer apalancamiento y margen ---
             if not self.trader.set_leverage(simbolo, 5):
                 print(f"❌ Falló al establecer apalancamiento 5x para {simbolo}")
                 return False
             if not self.trader.set_margin_isolated(simbolo):
                 print(f"❌ Falló al configurar margen AISLADO para {simbolo}")
                 return False
-            # --- 2. Calcular cantidad válida ---
             cantidad = self.calcular_tamaño_posicion(simbolo, precio_entrada)
             if not cantidad:
                 print(f"❌ No se pudo calcular cantidad válida para {simbolo}")
                 return False
             side = 'BUY' if tipo_operacion == 'LONG' else 'SELL'
             sl_side = 'SELL' if tipo_operacion == 'LONG' else 'BUY'
-            # --- 3. Obtener precio actual y ajustar SL/TP ---
             ticker = self.trader.client.futures_symbol_ticker(symbol=simbolo)
             precio_actual = float(ticker['price'])
             sl_ajustado, tp_ajustado = self.trader.validar_niveles_sl_tp(simbolo, sl_side, sl, tp)
             sl_ajustado, tp_ajustado = self.trader.verificar_distancia_ordenes(
                 simbolo, precio_actual, sl_ajustado, tp_ajustado, sl_side
             )
-            # --- 4. Abrir posición ---
             orden_principal = self.trader.place_market_order(simbolo, side, cantidad)
             if not orden_principal:
                 print(f"❌ Falló al abrir posición {tipo_operacion} en {simbolo}")
                 return False
             posicion_abierta = True
-            time.sleep(1.5)  # Asegurar sincronización con exchange
-            # --- 5. Intentar colocar SL y TP con reintentos ---
+            time.sleep(1.5)
             max_retries = 3
             for attempt in range(max_retries):
                 sl_order = self.trader.place_stop_loss_order(simbolo, sl_side, sl_ajustado)
                 tp_order = self.trader.place_take_profit_order(simbolo, sl_side, tp_ajustado)
                 if sl_order and tp_order:
                     print(f"✅ Operación {tipo_operacion} en {simbolo} completamente protegida (SL + TP)")
-                    return True  # ✅ ÚNICO PUNTO DE ÉXITO
-                # Si falla, ajustar niveles y reintentar
+                    return True
                 if attempt < max_retries - 1:
                     logger_binance.warning(f"🔄 Reintentando órdenes de cierre ({attempt + 1}/{max_retries}) en {simbolo}")
-                    # Aumentar margen de seguridad
                     if tipo_operacion == 'LONG':
                         sl_ajustado *= 0.995
                         tp_ajustado *= 1.005
@@ -918,7 +891,6 @@ class TradingBot:
                     time.sleep(2)
                 else:
                     logger_binance.error(f"❌ No se pudieron colocar ambas órdenes de cierre en {simbolo} tras {max_retries} intentos")
-            # --- 6. FALLA: Cancelar posición si no está protegida ---
             print(f"⚠️ Cancelando posición en {simbolo} por falta de protección (SL/TP)")
             self.trader.client.futures_create_order(
                 symbol=simbolo,
@@ -930,7 +902,6 @@ class TradingBot:
             return False
         except Exception as e:
             logger_binance.error(f"❌ Error crítico en ejecutar_operacion_binance({simbolo}): {e}")
-            # --- Manejo de fallo: cerrar posición si se abrió ---
             if posicion_abierta:
                 try:
                     logger_binance.warning(f"CloseOperation tras error: cerrando posición en {simbolo}")
@@ -943,45 +914,38 @@ class TradingBot:
                 except Exception as close_err:
                     logger_binance.error(f"❌ Error al cerrar posición tras fallo: {close_err}")
             return False
+
     # === NUEVA FUNCIÓN: Monitorear órdenes activas ===
     def monitorear_ordenes_activas(self):
-        """Monitorea y mantiene las órdenes de cierre activas"""
         if not self.trader or not self.operaciones_activas:
             return
         for simbolo, operacion in list(self.operaciones_activas.items()):
             try:
-                # Determinar side para órdenes de cierre
                 side_cierre = 'SELL' if operacion['tipo'] == 'LONG' else 'BUY'
-                # Verificar y recolocar órdenes si es necesario
                 ordenes_ok = self.trader.recolocar_ordenes_cierre(
-                    simbolo, 
-                    side_cierre, 
-                    operacion['stop_loss'], 
+                    simbolo,
+                    side_cierre,
+                    operacion['stop_loss'],
                     operacion['take_profit']
                 )
                 if not ordenes_ok:
                     logger_binance.error(f"🚨 CRÍTICO: No se pudieron mantener órdenes de cierre en {simbolo}")
             except Exception as e:
                 print(f"⚠️ Error monitoreando órdenes para {simbolo}: {e}")
-    # === FUNCIÓN MEJORADA: Verificar cierre operaciones ===
+
+    # ✅ FUNCIÓN MEJORADA: Verificar cierre operaciones (USANDO CACHE)
     def verificar_cierre_operaciones(self):
         if not self.operaciones_activas:
             return []
         operaciones_cerradas = []
-        # Obtener posiciones reales en Binance
-        try:
-            posiciones = self.trader.client.futures_position_information()
-            posiciones_dict = {p['symbol']: float(p['positionAmt']) for p in posiciones if float(p['positionAmt']) != 0}
-        except Exception as e:
-            print(f"⚠️ Error obteniendo posiciones reales: {e}")
-            posiciones_dict = {}
+        # Usar el cache ya cargado
+        posiciones_dict = getattr(self, 'posiciones_cache', {})
         for simbolo, operacion in list(self.operaciones_activas.items()):
             posicion_actual = posiciones_dict.get(simbolo, 0.0)
             if posicion_actual == 0.0:
-                # La posición ya se cerró en Binance → procesar cierre
                 datos_mercado = self.obtener_datos_mercado_config(
-                    simbolo, 
-                    operacion.get('timeframe_utilizado', '5m'), 
+                    simbolo,
+                    operacion.get('timeframe_utilizado', '5m'),
                     operacion.get('velas_utilizadas', 100)
                 )
                 if not datos_mercado:
@@ -1030,7 +994,6 @@ class TradingBot:
                     except Exception:
                         pass
                 self.registrar_operacion(datos_operacion)
-                # ✅ Cancelar órdenes huérfanas
                 if self.trader:
                     self.trader.cancelar_ordenes_cierre(simbolo)
                 operaciones_cerradas.append(simbolo)
@@ -1040,12 +1003,35 @@ class TradingBot:
                 self.operaciones_desde_optimizacion += 1
                 print(f"     📊 {simbolo} Cierre detectado (posición cerrada en Binance) - PnL: {pnl_percent:.2f}%")
         return operaciones_cerradas
+
+    # ✅ MODIFICACIÓN PRINCIPAL AQUÍ
+    def ejecutar_analisis(self):
+        # === OBTENER POSICIONES REALES UNA SOLA VEZ ===
+        self.posiciones_cache = {}
+        if self.trader:
+            try:
+                posiciones = self.trader.client.futures_position_information()
+                self.posiciones_cache = {p['symbol']: float(p['positionAmt']) for p in posiciones}
+            except Exception as e:
+                print(f"⚠️ Error obteniendo posiciones reales (uso cache vacío): {e}")
+                self.posiciones_cache = {}
+
+        if random.random() < 0.1:
+            self.reoptimizar_periodicamente()
+            self.verificar_envio_reporte_automatico()
+
+        self.monitorear_ordenes_activas()
+        cierres = self.verificar_cierre_operaciones()
+        if cierres:
+            print(f"     📊 Operaciones cerradas: {', '.join(cierres)}")
+        self.guardar_estado()
+        return self.escanear_mercado()
+
     def escanear_mercado(self):
         print(f"\n🔍 Escaneando {len(self.config.get('symbols', []))} símbolos (Estrategia: Breakout + Reentry)...")
         senales_encontradas = 0
         for simbolo in self.config.get('symbols', []):
             try:
-                # === VERIFICACIÓN ROBUSTA: No operar si ya hay posición activa ===
                 if self.simbolo_tiene_operacion_activa(simbolo):
                     continue
                 if simbolo in self.operaciones_activas:
@@ -1061,8 +1047,8 @@ class TradingBot:
                 info_canal = self.calcular_canal_regresion_config(datos_mercado, config_optima['num_velas'])
                 if not info_canal:
                     continue
-                if (info_canal['nivel_fuerza'] < 2 or 
-                    abs(info_canal['coeficiente_pearson']) < 0.4 or 
+                if (info_canal['nivel_fuerza'] < 2 or
+                    abs(info_canal['coeficiente_pearson']) < 0.4 or
                     info_canal['r2_score'] < 0.4):
                     continue
                 if simbolo not in self.esperando_reentry:
@@ -1096,7 +1082,7 @@ class TradingBot:
                         continue
                 if self.ejecutar_operacion_binance(simbolo, tipo_operacion, precio_entrada, sl, tp):
                     self.generar_senal_operacion(
-                        simbolo, tipo_operacion, precio_entrada, tp, sl, 
+                        simbolo, tipo_operacion, precio_entrada, tp, sl,
                         info_canal, datos_mercado, config_optima, self.esperando_reentry[simbolo]
                     )
                     senales_encontradas += 1
@@ -1112,6 +1098,7 @@ class TradingBot:
         else:
             print("❌ No se encontraron señales en este ciclo")
         return senales_encontradas
+
     def generar_senal_operacion(self, simbolo, tipo_operacion, precio_entrada, tp, sl,
                                 info_canal, datos_mercado, config_optima, breakout_info=None):
         if simbolo in self.senales_enviadas:
@@ -1183,6 +1170,7 @@ class TradingBot:
         }
         self.senales_enviadas.add(simbolo)
         self.total_operaciones += 1
+
     def inicializar_log(self):
         if not os.path.exists(self.archivo_log):
             with open(self.archivo_log, 'w', newline='', encoding='utf-8') as f:
@@ -1196,6 +1184,7 @@ class TradingBot:
                     'nivel_fuerza', 'timeframe_utilizado', 'velas_utilizadas',
                     'stoch_k', 'stoch_d', 'breakout_usado'
                 ])
+
     def registrar_operacion(self, datos_operacion):
         with open(self.archivo_log, 'a', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
@@ -1222,6 +1211,7 @@ class TradingBot:
                 datos_operacion.get('stoch_d', 0),
                 datos_operacion.get('breakout_usado', False)
             ])
+
     def filtrar_operaciones_ultima_semana(self):
         if not os.path.exists(self.archivo_log):
             return []
@@ -1248,6 +1238,7 @@ class TradingBot:
         except Exception as e:
             print(f"⚠️ Error filtrando operaciones: {e}")
             return []
+
     def generar_reporte_semanal(self):
         ops_ultima_semana = self.filtrar_operaciones_ultima_semana()
         if not ops_ultima_semana:
@@ -1294,6 +1285,7 @@ class TradingBot:
 ⚡ Estrategia: Breakout + Reentry
     """
         return mensaje
+
     def enviar_reporte_semanal(self):
         mensaje = self.generar_reporte_semanal()
         if not mensaje:
@@ -1309,6 +1301,7 @@ class TradingBot:
                 print(f"❌ Error enviando reporte: {e}")
                 return False
         return False
+
     def verificar_envio_reporte_automatico(self):
         ahora = datetime.now()
         if ahora.weekday() == 0 and 9 <= ahora.hour < 10:
@@ -1326,6 +1319,7 @@ class TradingBot:
             except Exception as e:
                 print(f"⚠️ Error en envío automático: {e}")
         return False
+
     def generar_mensaje_cierre(self, datos_operacion):
         emoji = "🟢" if datos_operacion['resultado'] == "TP" else "🔴"
         color_emoji = "✅" if datos_operacion['resultado'] == "TP" else "❌"
@@ -1353,6 +1347,7 @@ class TradingBot:
 🕒 {datos_operacion['timestamp']}
         """
         return mensaje
+
     def calcular_stochastic(self, datos_mercado, period=14, k_period=3, d_period=3):
         if len(datos_mercado['cierres']) < period:
             return 50, 50
@@ -1378,6 +1373,7 @@ class TradingBot:
                 k_final = k_smoothed[-1]
                 return k_final, d
         return 50, 50
+
     def calcular_regresion_lineal(self, x, y):
         if len(x) != len(y) or len(x) == 0:
             return None
@@ -1395,6 +1391,7 @@ class TradingBot:
             pendiente = (n * sum_xy - sum_x * sum_y) / denom
         intercepto = (sum_y - pendiente * sum_x) / n if n else 0
         return pendiente, intercepto
+
     def calcular_pearson_y_angulo(self, x, y):
         if len(x) != len(y) or len(x) < 2:
             return 0, 0
@@ -1416,6 +1413,7 @@ class TradingBot:
         angulo_radianes = math.atan(pendiente * len(x) / (max(y) - min(y)) if (max(y) - min(y)) != 0 else 0)
         angulo_grados = math.degrees(angulo_radianes)
         return pearson, angulo_grados
+
     def clasificar_fuerza_tendencia(self, angulo_grados):
         angulo_abs = abs(angulo_grados)
         if angulo_abs < 3:
@@ -1428,6 +1426,7 @@ class TradingBot:
             return "💚 Fuerte", 4
         else:
             return "💙 Muy Fuerte", 5
+
     def determinar_direccion_tendencia(self, angulo_grados, umbral_minimo=1):
         if abs(angulo_grados) < umbral_minimo:
             return "⚪ RANGO"
@@ -1435,6 +1434,7 @@ class TradingBot:
             return "🟢 ALCISTA"
         else:
             return "🔴 BAJISTA"
+
     def calcular_r2(self, y_real, x, pendiente, intercepto):
         if len(y_real) != len(x):
             return 0
@@ -1445,6 +1445,7 @@ class TradingBot:
         if ss_tot == 0:
             return 0
         return 1 - (ss_res / ss_tot)
+
     def _enviar_telegram_simple(self, mensaje, token, chat_ids):
         if not token:
             print("⚠️ TELEGRAM_TOKEN no está definido en las variables de entorno.")
@@ -1469,6 +1470,7 @@ class TradingBot:
                 print(f"❌ Excepción al enviar a {chat_id}: {e}")
                 resultados.append(False)
         return any(resultados)
+
     def reoptimizar_periodicamente(self):
         try:
             horas_desde_opt = (datetime.now() - self.ultima_optimizacion).total_seconds() / 7200
@@ -1483,29 +1485,21 @@ class TradingBot:
                     print("✅ Parámetros actualizados en tiempo real")
         except Exception as e:
             print(f"⚠ Error en re-optimización automática: {e}")
+
     def actualizar_parametros(self, nuevos_parametros):
-        self.config['trend_threshold_degrees'] = nuevos_parametros.get('trend_threshold_degrees', 
+        self.config['trend_threshold_degrees'] = nuevos_parametros.get('trend_threshold_degrees',
                                                                         self.config.get('trend_threshold_degrees', 16))
-        self.config['min_trend_strength_degrees'] = nuevos_parametros.get('min_trend_strength_degrees', 
+        self.config['min_trend_strength_degrees'] = nuevos_parametros.get('min_trend_strength_degrees',
                                                                            self.config.get('min_trend_strength_degrees', 16))
-        self.config['entry_margin'] = nuevos_parametros.get('entry_margin', 
+        self.config['entry_margin'] = nuevos_parametros.get('entry_margin',
                                                              self.config.get('entry_margin', 0.001))
-    def ejecutar_analisis(self):
-        if random.random() < 0.1:
-            self.reoptimizar_periodicamente()
-            self.verificar_envio_reporte_automatico()    
-        # === AGREGAR MONITOREO CONTINUO DE ÓRDENES ===
-        self.monitorear_ordenes_activas()
-        cierres = self.verificar_cierre_operaciones()
-        if cierres:
-            print(f"     📊 Operaciones cerradas: {', '.join(cierres)}")
-        self.guardar_estado()
-        return self.escanear_mercado()
+
     def mostrar_resumen_operaciones(self):
         print(f"\n📊 RESUMEN OPERACIONES:")
         print(f"   Activas: {len(self.operaciones_activas)}")
         print(f"   Esperando reentry: {len(self.esperando_reentry)}")
         print(f"   Total ejecutadas: {self.total_operaciones}")
+
     def iniciar(self):
         print("\n" + "=" * 70)
         print("🤖 BOT DE TRADING - ESTRATEGIA BREAKOUT + REENTRY")
@@ -1545,6 +1539,7 @@ class TradingBot:
                 self.guardar_estado()
             except:
                 pass
+
 # ---------------------------
 # CONFIGURACIÓN SIMPLE
 # ---------------------------
@@ -1578,12 +1573,14 @@ def crear_config_desde_entorno():
         'binance_secret_key': os.environ.get('BINANCE_SECRET_KEY'),
         'binance_testnet': os.environ.get('BINANCE_TESTNET', 'true').lower() == 'true'
     }
+
 # ---------------------------
 # FLASK APP Y RENDER
 # ---------------------------
 app = Flask(__name__)
 config = crear_config_desde_entorno()
 bot = TradingBot(config)
+
 def run_bot_loop():
     while True:
         try:
@@ -1592,11 +1589,14 @@ def run_bot_loop():
         except Exception as e:
             print(f"Error en el hilo del bot: {e}", file=sys.stderr)
             time.sleep(60)
+
 bot_thread = threading.Thread(target=run_bot_loop, daemon=True)
 bot_thread.start()
+
 @app.route('/')
 def index():
     return "Bot Breakout + Reentry está en línea.", 200
+
 @app.route('/webhook', methods=['POST'])
 def telegram_webhook():
     if request.is_json:
@@ -1604,6 +1604,7 @@ def telegram_webhook():
         print(f"Update recibido: {json.dumps(update)}", file=sys.stdout)
         return jsonify({"status": "ok"}), 200
     return jsonify({"error": "Request must be JSON"}), 400
+
 def setup_telegram_webhook():
     token = os.environ.get('TELEGRAM_TOKEN')
     if not token:
@@ -1620,6 +1621,7 @@ def setup_telegram_webhook():
         requests.get(f"https://api.telegram.org/bot{token}/setWebhook?url={webhook_url}")
     except Exception as e:
         print(f"Error configurando webhook: {e}", file=sys.stderr)
+
 if __name__ == '__main__':
     setup_telegram_webhook()
     app.run(debug=True, port=5000)
