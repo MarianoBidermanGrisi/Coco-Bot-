@@ -683,7 +683,7 @@ class TradingBot:
         stoch_k = info_canal['stoch_k']
         stoch_d = info_canal['stoch_d']
         tolerancia = 0.001 * precio_actual
-        if breakpoint_info['tipo'] == "BREAKOUT_LONG":
+        if breakout_info['tipo'] == "BREAKOUT_LONG":
             if soporte <= precio_actual <= resistencia:
                 distancia_soporte = abs(precio_actual - soporte)
                 if distancia_soporte <= tolerancia and stoch_k <= 30 and stoch_d <= 30:
