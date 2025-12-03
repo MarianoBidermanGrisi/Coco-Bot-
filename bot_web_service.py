@@ -520,7 +520,7 @@ class TradingBot:
             if ultima_busqueda and (datetime.now() - ultima_busqueda).total_seconds() < 7200:
                 return self.config_optima_por_simbolo[simbolo]
         print(f"   🔍 Buscando configuración óptima para {simbolo}...")
-        timeframes = self.config.get('timeframes', ['1m', '3m', '5m', '15m', '30m'])
+        timeframes = self.config.get('timeframes', ['5m', '15m', '30m', '1h', '4h'])
         velas_options = self.config.get('velas_options', [80, 100, 120, 150, 200])
         mejor_config = None
         mejor_puntaje = -999999
