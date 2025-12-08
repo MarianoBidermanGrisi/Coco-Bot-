@@ -7,6 +7,7 @@
 # ✅ MODIFICACIÓN: time.sleep(0.1) en OptimizadorIA para reducir carga
 # ✅ NUEVO: Caché de info de símbolos (precisión, filtros) con TTL de 15 min
 # ✅ NUEVO: Validación estricta de precisión antes de redondear en SL/TP
+# ✅ FIX CRÍTICO: Error -1003 prevenido con caché de apalancamiento/margen y retrasos estratégicos
 import requests
 import time
 import json
@@ -39,30 +40,65 @@ class PositionWebSocket:
         self.running = False
 
     async def listen_positions(self, cache_dict):
-        client = await AsyncClient.create(
-            api_key=self.api_key,
-            api_secret=self.secret_key,
-            testnet=self.testnet
-        )
-        bm = BinanceSocketManager(client)
-        ts = bm.futures_user_socket()
-        self.running = True
-        print("📡 Iniciando WebSocket para posiciones (futures_user_socket)...")
-        async with ts as tscm:
-            while self.running:
-                try:
-                    msg = await tscm.recv()
-                    if msg.get('e') == 'ACCOUNT_UPDATE' and 'a' in msg:
-                        for position in msg['a']['P']:
-                            symbol = position['s']
-                            position_amt = float(position['pa'])
-                            cache_dict[symbol] = position_amt
-                            if position_amt == 0.0:
-                                print(f"isclosed via WebSocket: {symbol}")
-                except Exception as e:
+        client = None
+        retry_count = 0
+        max_retries = 5
+        retry_delay = 30  # segundos
+        
+        while self.running and retry_count < max_retries:
+            try:
+                client = await AsyncClient.create(
+                    api_key=self.api_key,
+                    api_secret=self.secret_key,
+                    testnet=self.testnet
+                )
+                bm = BinanceSocketManager(client)
+                ts = bm.futures_user_socket()
+                retry_count = 0  # Resetear contador en conexión exitosa
+                
+                print("📡 Iniciando WebSocket para posiciones (futures_user_socket)...")
+                async with ts as tscm:
+                    while self.running:
+                        try:
+                            msg = await tscm.recv()
+                            if msg.get('e') == 'ACCOUNT_UPDATE' and 'a' in msg:
+                                for position in msg['a']['P']:
+                                    symbol = position['s']
+                                    position_amt = float(position['pa'])
+                                    cache_dict[symbol] = position_amt
+                                    if position_amt == 0.0:
+                                        print(f"isclosed via WebSocket: {symbol}")
+                        except Exception as e:
+                            print(f"⚠️ Error en WebSocket: {e}")
+                            await asyncio.sleep(1)
+                            continue
+                            
+            except BinanceAPIException as e:
+                if e.code == -1003:
+                    print(f"⚠️ Error -1003 en WebSocket: {e}")
+                    retry_count += 1
+                    wait_time = retry_delay * retry_count
+                    print(f"🔄 Reintentando WebSocket en {wait_time} segundos...")
+                    await asyncio.sleep(wait_time)
+                else:
                     print(f"⚠️ Error en WebSocket: {e}")
-                    continue
-        await client.close_connection()
+                    retry_count += 1
+                    await asyncio.sleep(retry_delay)
+                    
+            except Exception as e:
+                print(f"⚠️ Error general en WebSocket: {e}")
+                retry_count += 1
+                await asyncio.sleep(retry_delay)
+                
+            finally:
+                if client:
+                    try:
+                        await client.close_connection()
+                    except:
+                        pass
+        
+        if retry_count >= max_retries:
+            print("❌ WebSocket: Máximo de reintentos alcanzado. Continuando sin actualizaciones en tiempo real.")
 
     def start_background_listener(self, cache_dict):
         def run_async():
@@ -81,9 +117,27 @@ class BinanceTrader:
         else:
             self.client = Client(api_key, secret_key, tld='com')
             logger_binance.warning("🚨 BinanceTrader inicializado en MODO REAL. 🚨")
+        
+        # Caché para evitar solicitudes repetidas
+        self.leverage_cache = {}
+        self.margin_cache = {}
+        self.last_request_time = {}
+        self.min_request_interval = 2.0  # 2 segundos mínimo entre solicitudes
+
+    def _rate_limit_check(self, endpoint):
+        """Control de tasa para evitar error -1003"""
+        now = time.time()
+        key = endpoint
+        if key in self.last_request_time:
+            elapsed = now - self.last_request_time[key]
+            if elapsed < self.min_request_interval:
+                sleep_time = self.min_request_interval - elapsed
+                time.sleep(sleep_time)
+        self.last_request_time[key] = time.time()
 
     def check_connection(self):
         try:
+            self._rate_limit_check("ping")
             self.client.ping()
             server_status = self.client.get_system_status()
             if server_status['status'] == 0:
@@ -98,22 +152,52 @@ class BinanceTrader:
 
     def set_leverage(self, symbol, leverage):
         try:
+            # Verificar si ya está configurado
+            cache_key = f"{symbol}_{leverage}"
+            if cache_key in self.leverage_cache:
+                logger_binance.info(f"✅ Apalancamiento {leverage}x ya estaba configurado para {symbol} (en caché).")
+                return True
+                
+            self._rate_limit_check(f"leverage_{symbol}")
             self.client.futures_change_leverage(symbol=symbol, leverage=leverage)
+            self.leverage_cache[cache_key] = True
             logger_binance.info(f"✅ Apalancamiento {leverage}x establecido para {symbol}.")
             return True
+        except BinanceAPIException as e:
+            if e.code == -1003:
+                logger_binance.warning(f"⚠️ Rate limit alcanzado para apalancamiento {symbol}. Usando valor en caché.")
+                # Intentar usar valor en caché si existe
+                for key in self.leverage_cache:
+                    if symbol in key:
+                        return True
+                return False
+            else:
+                logger_binance.error(f"❌ Error al establecer apalancamiento: {e}")
+                return False
         except Exception as e:
             logger_binance.error(f"❌ Error al establecer apalancamiento: {e}")
             return False
 
     def set_margin_isolated(self, symbol):
         try:
+            # Verificar si ya está configurado
+            if symbol in self.margin_cache:
+                logger_binance.info(f"✅ Margen AISLADO ya estaba configurado para {symbol} (en caché).")
+                return True
+                
+            self._rate_limit_check(f"margin_{symbol}")
             self.client.futures_change_margin_type(symbol=symbol, marginType='ISOLATED')
+            self.margin_cache[symbol] = True
             logger_binance.info(f"✅ Margen configurado como AISLADO para {symbol}")
             return True
         except BinanceAPIException as e:
             if e.code == -4046:
+                self.margin_cache[symbol] = True
                 logger_binance.info(f"ℹ️ Margen ya estaba como AISLADO para {symbol}")
                 return True
+            elif e.code == -1003:
+                logger_binance.warning(f"⚠️ Rate limit alcanzado para margen {symbol}. Usando valor en caché.")
+                return symbol in self.margin_cache
             else:
                 logger_binance.error(f"❌ Error configurando margen AISLADO para {symbol}: {e}")
                 return False
@@ -123,6 +207,7 @@ class BinanceTrader:
 
     def get_account_info(self):
         try:
+            self._rate_limit_check("account_info")
             return self.client.futures_account()
         except Exception as e:
             logger_binance.error(f"❌ Error al obtener info de cuenta: {e}")
@@ -130,6 +215,7 @@ class BinanceTrader:
 
     def get_symbol_info(self, symbol):
         try:
+            self._rate_limit_check("exchange_info")
             exchange_info = self.client.futures_exchange_info()
             for s in exchange_info['symbols']:
                 if s['symbol'] == symbol:
@@ -189,6 +275,7 @@ class BinanceTrader:
                             return None
                         break
             logger_binance.info(f"📈 Enviando orden MARKET: {side} {quantity} {symbol}")
+            self._rate_limit_check(f"order_{symbol}")
             order = self.client.futures_create_order(
                 symbol=symbol,
                 side=side,
@@ -203,7 +290,11 @@ class BinanceTrader:
                 if quantity > 0.001:
                     new_quantity = quantity * 0.95
                     logger_binance.info(f"🔄 Reintentando con cantidad reducida: {new_quantity}")
+                    time.sleep(1)  # Esperar antes de reintentar
                     return self.place_market_order(symbol, side, new_quantity)
+            elif e.code == -1003:
+                logger_binance.error(f"❌ Rate limit alcanzado para orden en {symbol}. Intentando más tarde.")
+                return None
             else:
                 logger_binance.error(f"❌ Error al colocar orden: {e}")
             return None
@@ -219,6 +310,7 @@ class BinanceTrader:
                 return None
             stop_price = round(stop_price, precision)
             logger_binance.info(f"🛑 Colocando STOP_MARKET: {side} en {symbol} a {stop_price} (precisión: {precision})")
+            self._rate_limit_check(f"stop_loss_{symbol}")
             order = self.client.futures_create_order(
                 symbol=symbol,
                 side=side,
@@ -228,6 +320,12 @@ class BinanceTrader:
             )
             logger_binance.info(f"✅ Stop-Loss colocado. ID: {order['orderId']}")
             return order
+        except BinanceAPIException as e:
+            if e.code == -1003:
+                logger_binance.error(f"❌ Rate limit alcanzado para Stop-Loss en {symbol}")
+                return None
+            logger_binance.error(f"❌ Error al colocar Stop-Loss: {e}")
+            return None
         except Exception as e:
             logger_binance.error(f"❌ Error al colocar Stop-Loss: {e}")
             return None
@@ -240,6 +338,7 @@ class BinanceTrader:
                 return None
             take_profit_price = round(take_profit_price, precision)
             logger_binance.info(f"🎯 Colocando TAKE_PROFIT_MARKET: {side} en {symbol} a {take_profit_price} (precisión: {precision})")
+            self._rate_limit_check(f"take_profit_{symbol}")
             order = self.client.futures_create_order(
                 symbol=symbol,
                 side=side,
@@ -249,12 +348,19 @@ class BinanceTrader:
             )
             logger_binance.info(f"✅ Take-Profit colocado. ID: {order['orderId']}")
             return order
+        except BinanceAPIException as e:
+            if e.code == -1003:
+                logger_binance.error(f"❌ Rate limit alcanzado para Take-Profit en {symbol}")
+                return None
+            logger_binance.error(f"❌ Error al colocar Take-Profit: {e}")
+            return None
         except Exception as e:
             logger_binance.error(f"❌ Error al colocar Take-Profit: {e}")
             return None
 
     def validar_niveles_sl_tp(self, symbol, side, sl_price, tp_price):
         try:
+            self._rate_limit_check(f"ticker_{symbol}")
             ticker = self.client.futures_symbol_ticker(symbol=symbol)
             precio_actual = float(ticker['price'])
             symbol_info = self.get_symbol_info(symbol)
@@ -317,6 +423,7 @@ class BinanceTrader:
 
     def cancelar_ordenes_cierre(self, symbol):
         try:
+            self._rate_limit_check(f"open_orders_{symbol}")
             open_orders = self.client.futures_get_open_orders(symbol=symbol)
             for order in open_orders:
                 if order['type'] in ['STOP_MARKET', 'TAKE_PROFIT_MARKET']:
@@ -327,6 +434,7 @@ class BinanceTrader:
 
     def verificar_ordenes_cierre_activas(self, symbol):
         try:
+            self._rate_limit_check(f"open_orders_{symbol}")
             open_orders = self.client.futures_get_open_orders(symbol=symbol)
             sl_active = any(order['type'] == 'STOP_MARKET' for order in open_orders)
             tp_active = any(order['type'] == 'TAKE_PROFIT_MARKET' for order in open_orders)
@@ -652,6 +760,7 @@ class TradingBot:
         url = "https://api.binance.com/api/v3/klines"
         params = {'symbol': simbolo, 'interval': timeframe, 'limit': num_velas + 14}
         try:
+            time.sleep(0.2)  # Evitar rate limit en Binance
             respuesta = requests.get(url, params=params, timeout=10)
             datos = respuesta.json()
             if not isinstance(datos, list) or len(datos) == 0:
@@ -974,12 +1083,13 @@ class TradingBot:
         tp_order = None
 
         try:
+            # Verificar y configurar apalancamiento (con caché)
             if not self.trader.set_leverage(simbolo, 10):
-                print(f"❌ Falló al establecer apalancamiento 10x para {simbolo}")
-                return False
+                print(f"⚠️ Advertencia: Falló al establecer apalancamiento 10x para {simbolo}. Continuando con configuración actual.")
+            
+            # Verificar y configurar margen (con caché)
             if not self.trader.set_margin_isolated(simbolo):
-                print(f"❌ Falló al configurar margen AISLADO para {simbolo}")
-                return False
+                print(f"⚠️ Advertencia: Falló al configurar margen AISLADO para {simbolo}. Continuando con configuración actual.")
 
             cantidad = self.calcular_tamaño_posicion(simbolo, precio_entrada)
             if not cantidad:
@@ -989,10 +1099,12 @@ class TradingBot:
             side = 'BUY' if tipo_operacion == 'LONG' else 'SELL'
             sl_side = 'SELL' if tipo_operacion == 'LONG' else 'BUY'
 
+            # Obtener precio actual con rate limiting
+            time.sleep(0.5)
             ticker = self.trader.client.futures_symbol_ticker(symbol=simbolo)
             precio_actual = float(ticker['price'])
 
-            # Ahora usamos get_price_precision con validación
+            # Usar get_price_precision con validación
             precision_price = self.trader.get_price_precision(simbolo)
             if precision_price is None or not (0 <= precision_price <= 10):
                 logger_binance.error(f"❌ Precisión de precio inválida para {simbolo}. Abortando operación.")
@@ -1003,17 +1115,23 @@ class TradingBot:
                 simbolo, precio_actual, sl_ajustado, tp_ajustado, sl_side
             )
 
+            # Colocar orden principal con delay para evitar rate limit
+            time.sleep(1)
             orden_principal = self.trader.place_market_order(simbolo, side, cantidad)
             if not orden_principal:
                 print(f"❌ Falló al abrir posición {tipo_operacion} en {simbolo}")
                 return False
 
             posicion_abierta = True
-            time.sleep(1.5)
+            time.sleep(2)  # Aumentado para dar tiempo al exchange
 
             max_retries = 3
             for attempt in range(max_retries):
+                # Colocar órdenes de cierre con delays
+                time.sleep(1)
                 sl_order = self.trader.place_stop_loss_order(simbolo, sl_side, sl_ajustado)
+                
+                time.sleep(1)
                 tp_order = self.trader.place_take_profit_order(simbolo, sl_side, tp_ajustado)
 
                 if sl_order and tp_order:
@@ -1028,11 +1146,12 @@ class TradingBot:
                     else:
                         sl_ajustado *= 1.005
                         tp_ajustado *= 0.995
-                    time.sleep(2)
+                    time.sleep(3)  # Más tiempo entre reintentos
                 else:
                     logger_binance.error(f"❌ No se pudieron colocar ambas órdenes de cierre en {simbolo} tras {max_retries} intentos")
 
             print(f"⚠️ Cancelando posición en {simbolo} por falta de protección (SL/TP)")
+            time.sleep(1)
             self.trader.client.futures_create_order(
                 symbol=simbolo,
                 side='SELL' if side == 'BUY' else 'BUY',
@@ -1047,6 +1166,7 @@ class TradingBot:
             if posicion_abierta:
                 try:
                     logger_binance.warning(f"CloseOperation tras error: cerrando posición en {simbolo}")
+                    time.sleep(1)
                     self.trader.client.futures_create_order(
                         symbol=simbolo,
                         side='SELL' if tipo_operacion == 'LONG' else 'BUY',
@@ -1071,6 +1191,7 @@ class TradingBot:
                 )
                 if not ordenes_ok:
                     logger_binance.error(f"🚨 CRÍTICO: No se pudieron mantener órdenes de cierre en {simbolo}")
+                time.sleep(0.5)  # Delay entre monitoreo de símbolos
             except Exception as e:
                 print(f"⚠️ Error monitoreando órdenes para {simbolo}: {e}")
 
@@ -1083,6 +1204,7 @@ class TradingBot:
             posicion_actual = self.posiciones_cache.get(simbolo, 0.0)
             if posicion_actual == 0.0:
                 if self.trader:
+                    time.sleep(0.5)
                     self.trader.cancelar_ordenes_cierre(simbolo)
                     print(f"     🧹 Órdenes de cierre huérfanas canceladas para {simbolo}")
 
@@ -1170,6 +1292,10 @@ class TradingBot:
             print(f"   ➤ Analizando {i+1}/{simbolos_a_analizar}: {simbolo}")
 
             try:
+                # Añadir delay entre análisis de símbolos
+                if i > 0:
+                    time.sleep(1)
+                    
                 if not self.simbolo_tiene_operacion_activa(simbolo) and simbolo not in self.operaciones_activas:
                     config_optima = self.buscar_configuracion_optima_simbolo(simbolo)
                     if config_optima:
@@ -1668,6 +1794,7 @@ class TradingBot:
         print("📌 MODO MARGEN: AISLADO")
         print("🛡️  STOP LOSS PERSISTENTE: ACTIVADO")
         print("📡 POSICIONES: WebSocket en tiempo real (¡Sin polling!)")
+        print("🛡️  RATE LIMITING: Activado para prevenir error -1003")
         print("=" * 70)
         print(f"💱 Símbolos: {len(self.config.get('symbols', []))} monedas")
         print(f"📏 ANCHO MÍNIMO: {self.config.get('min_channel_width_percent', 4)}%")
@@ -1715,14 +1842,19 @@ def crear_config_desde_entorno():
         'min_trend_strength_degrees': 16.0,
         'entry_margin': 0.001,
         'min_rr_ratio': 1.2,
-        'scan_interval_minutes': 1,
-        'timeframes': ['5m', '15m', '30m', '1h', '4h'],
+        'scan_interval_minutes': 3,
+        'timeframes': ['5m', '15m', '30m', '1h'],
         'velas_options': [80, 100, 120, 150, 200],
         'symbols': [
             'XMRUSDT','AAVEUSDT','DOTUSDT','LINKUSDT','BNBUSDT','XRPUSDT','SOLUSDT','AVAXUSDT',
-            'DOGEUSDT','LTCUSDT','ATOMUSDT','XLMUSDT','ALGOUSDT','VETUSDT','ICPUSDT','FILUSDT',
-            'BCHUSDT','EOSUSDT','TRXUSDT','XTZUSDT','SUSHIUSDT','COMPUSDT','YFIUSDT','ETCUSDT',
-            'SNXUSDT','RENUSDT','1INCHUSDT','NEOUSDT','ZILUSDT','HOTUSDT','ENJUSDT','ZECUSDT'
+          'DOGEUSDT','LTCUSDT','ATOMUSDT','XLMUSDT','ALGOUSDT','VETUSDT','ICPUSDT','FILUSDT',
+          'BCHUSDT','NEOUSDT','TRXUSDT','XTZUSDT','SUSHIUSDT','COMPUSDT','PEPEUSDT','ETCUSDT',
+          'SNXUSDT','RENDERUSDT','1INCHUSDT','UNIUSDT','ZILUSDT','HOTUSDT','ENJUSDT','HYPEUSDT',
+          'BEATUSDT','PIPPINUSDT','ADAUSDT','ASTERUSDT','ENAUSDT','TAOUSDT','HEMIUSDT','LUNCUSDT',
+         'WLDUSDT','WIFUSDT','APTUSDT','HBARUSDT','CRVUSDT','BSUUSDT','LUNAUSDT','FETUSDT','PUMPUSDT',
+        'POWERUSDT','TIAUSDT','ARBUSDT','ONDOUSDT','1000BONKUSDT','FOLKSUSDT','BRETTUSDT','TRUMPUSDT',
+          'PARTIUSDT','INJUSDT','SPXUSDT','ZECUSDT','NOTUSDT','WLFIUSDT','SHIBUSDT','LDOUSDT',
+         'VIRTUALUSDT','TURBOUSDT','KASUSDT','EIGENUSDT','STRKUSDT','DYDXUSDT','ZKUSDT','SEIUSDT','TAKEUSDT','TONUSDT','MONUSDT','NMRUSDT'
         ],
         'telegram_token': os.environ.get('TELEGRAM_TOKEN'),
         'telegram_chat_ids': telegram_chat_ids,
