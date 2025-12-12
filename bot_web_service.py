@@ -12,12 +12,26 @@ import csv
 import itertools
 import statistics
 import random
-import matplotlib
-matplotlib.use('Agg')  # Backend sin GUI
-import matplotlib.pyplot as plt
-import mplfinance as mpf
-import pandas as pd
-from io import BytesIO
+
+# Intentar importar matplotlib, pero continuar si no está disponible
+try:
+    import matplotlib
+    matplotlib.use('Agg')  # Backend sin GUI
+    import matplotlib.pyplot as plt
+    import mplfinance as mpf
+    import pandas as pd
+    from io import BytesIO
+    MATPLOTLIB_AVAILABLE = True
+except ImportError as e:
+    print(f"⚠️ Advertencia: matplotlib/mplfinance no disponible: {e}")
+    print("⚠️ Los gráficos no se generarán, pero el bot continuará funcionando.")
+    MATPLOTLIB_AVAILABLE = False
+    # Crear objetos dummy para evitar errores
+    plt = None
+    mpf = None
+    pd = None
+    BytesIO = None
+
 from flask import Flask, request, jsonify
 import threading
 import logging
@@ -47,12 +61,6 @@ import csv
 import itertools
 import statistics
 import random
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-import mplfinance as mpf
-import pandas as pd
-from io import BytesIO
 
 # ---------------------------
 # OPTIMIZADOR IA
@@ -981,6 +989,10 @@ class TradingBot:
         Genera gráfico especial para el momento del BREAKOUT
         Marca visualmente la ruptura del canal
         """
+        if not MATPLOTLIB_AVAILABLE:
+            print("     ⚠️ Matplotlib no disponible, omitiendo gráfico")
+            return None
+            
         try:
             import matplotlib.font_manager as fm
             plt.rcParams['font.family'] = ['DejaVu Sans', 'Segoe UI Emoji', 'Apple Color Emoji', 'Noto Color Emoji']
@@ -1399,13 +1411,14 @@ class TradingBot:
         chat_ids = self.config.get('telegram_chat_ids', [])
         if token and chat_ids:
             try:
-                print(f"     📊 Generando gráfico para {simbolo}...")
-                buf = self.generar_grafico_profesional(simbolo, info_canal, datos_mercado, 
-                                                      precio_entrada, tp, sl, tipo_operacion)
-                if buf:
-                    print(f"     📨 Enviando gráfico por Telegram...")
-                    self.enviar_grafico_telegram(buf, token, chat_ids)
-                    time.sleep(1)
+                if MATPLOTLIB_AVAILABLE:
+                    print(f"     📊 Generando gráfico para {simbolo}...")
+                    buf = self.generar_grafico_profesional(simbolo, info_canal, datos_mercado, 
+                                                          precio_entrada, tp, sl, tipo_operacion)
+                    if buf:
+                        print(f"     📨 Enviando gráfico por Telegram...")
+                        self.enviar_grafico_telegram(buf, token, chat_ids)
+                        time.sleep(1)
                 self._enviar_telegram_simple(mensaje, token, chat_ids)
                 print(f"     ✅ Señal {tipo_operacion} para {simbolo} enviada")
             except Exception as e:
@@ -1838,6 +1851,10 @@ class TradingBot:
         return 1 - (ss_res / ss_tot)
 
     def generar_grafico_profesional(self, simbolo, info_canal, datos_mercado, precio_entrada, tp, sl, tipo_operacion):
+        if not MATPLOTLIB_AVAILABLE:
+            print("     ⚠️ Matplotlib no disponible, omitiendo gráfico")
+            return None
+            
         try:
             config_optima = self.config_optima_por_simbolo.get(simbolo)
             if not config_optima:
