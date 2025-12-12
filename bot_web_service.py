@@ -21,7 +21,7 @@ try:
     import mplfinance as mpf
     import pandas as pd
     from io import BytesIO
-    MATPLOTLIB_AVAILABLE = false
+    MATPLOTLIB_AVAILABLE = true
 except ImportError as e:
     print(f"⚠️ Advertencia: matplotlib/mplfinance no disponible: {e}")
     print("⚠️ Los gráficos no se generarán, pero el bot continuará funcionando.")
