@@ -25,7 +25,7 @@ try:
 except ImportError as e:
     print(f"⚠️ Advertencia: matplotlib/mplfinance no disponible: {e}")
     print("⚠️ Los gráficos no se generarán, pero el bot continuará funcionando.")
-    MATPLOTLIB_AVAILABLE = False
+    MATPLOTLIB_AVAILABLE = true
     # Crear objetos dummy para evitar errores
     plt = None
     mpf = None
